@@ -11,12 +11,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ==========================================
 # CONFIGURAÇÕES DO ECCO-MIX TRICK
 # ==========================================
-TOKEN = os.environ["BOT_TOKEN"]
-DATABASE_URL = os.environ["DATABASE_URL"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"].rstrip("/")
+TOKEN = os.environ["BOT_TOKEN"].strip()
+DATABASE_URL = os.environ["DATABASE_URL"].strip()
+WEBHOOK_URL = os.environ["WEBHOOK_URL"].strip().rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
-# IDs dos donos/super-admins (pode configurar na variável ADMIN_IDS do Render separando por vírgula ou colocar na lista abaixo)
 SUPER_ADMINS = [123456789]
 env_admins = os.environ.get("ADMIN_IDS", "")
 if env_admins:
@@ -24,7 +23,6 @@ if env_admins:
 
 GIROS_DIARIOS = 10
 
-# 5 Tiers: quanto maior o Tier, menor o peso (mais difícil de cair)
 TIERS_CONFIG = {
     1: {"nome": "Tier 1 (Comum)", "peso": 48},
     2: {"nome": "Tier 2 (Incomum)", "peso": 27},
@@ -33,7 +31,6 @@ TIERS_CONFIG = {
     5: {"nome": "Tier 5 (Lendário)", "peso": 3},
 }
 
-# Catálogo inicial carregado automaticamente no banco (editável pelos adms depois)
 CATALOGO_INICIAL = {
     "Animes": [],
     "Séries": [],
@@ -107,7 +104,6 @@ def iniciar_banco():
         );
     """)
 
-    # Popula o catálogo inicial apenas se a tabela de categorias estiver vazia
     cur.execute("SELECT COUNT(*) FROM categorias")
     if cur.fetchone()[0] == 0:
         for cat_nome, subs in CATALOGO_INICIAL.items():
@@ -255,12 +251,10 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
         await query.answer("Categoria não encontrada.", show_alert=True)
         return
 
-    # Se não tiver subcategorias (ex: Animes, Séries, Filmes, Brainrots), gira direto
     if not subs:
         await executar_sorteio(query, cat_id=cat_id, sub_id=None)
         return
 
-    # Se tiver subcategorias (ex: Música), abre o submenu de categorias
     botoes = []
     linha = []
     for sub_id, sub_nome in subs:
@@ -325,7 +319,6 @@ async def executar_sorteio(query, cat_id=None, sub_id=None):
     pesos = [c[5] for c in cartas]
     carta_id, nome_carta, nome_cat, nome_sub, tier, _, file_id, media_type = random.choices(cartas, weights=pesos, k=1)[0]
 
-    # Desconta 1 giro e atualiza inventário
     cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - 1 WHERE user_id = %s", (user.id,))
     cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
     item = cur.fetchone()
@@ -337,7 +330,6 @@ async def executar_sorteio(query, cat_id=None, sub_id=None):
         cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
         status_carta = "Nova na coleção!"
 
-    # Calcula progresso desse artista/personagem (de 5 tiers)
     cur.execute("""
         SELECT COUNT(DISTINCT c.tier)
         FROM inventario i
@@ -910,7 +902,6 @@ async def cmd_add_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         sub_id, sub_oficial = sub
 
-    # Trava de 1 carta por Tier para o mesmo artista/personagem
     cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s", (nome_carta, tier))
     existente = cur.fetchone()
     if existente:
@@ -1118,7 +1109,14 @@ async def cmd_rem_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 async def main():
     iniciar_banco()
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
 
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
@@ -1148,10 +1146,6 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_girar_subcategoria, pattern=r"^rsub\|"))
     app.add_handler(CallbackQueryHandler(callback_troca, pattern=r"^trade\|"))
 
-    await app.initialize()
-    await app.start()
-    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
-
     async def handle_webhook(request):
         data = await request.json()
         update = Update.de_json(data, app.bot)
@@ -1169,6 +1163,10 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+
+    await app.initialize()
+    await app.start()
+    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
 
     await asyncio.Event().wait()
 
