@@ -33,7 +33,7 @@ if env_admins:
 
 GIROS_DIARIOS = 10
 LARGURA_CARTA = 900
-ALTURA_CARTA = 1800
+ALTURA_CARTA = 1200
 
 TIERS_CONFIG = {
     1: {"nome": "Tier 1 (Comum)", "curto": "Tier 1", "emoji": "🌱", "peso": 48},
