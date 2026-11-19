@@ -76,7 +76,10 @@ TEXTOS_PADRAO = {
         "• /artista <code>nome</code> — Ver seu progresso nos tiers de um artista/personagem\n"
         "• /ranking <code>nome</code> — Ver ranking de jogadores de um artista/personagem\n"
         "• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
-        "• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
+        "• /trocar <code>@pessoa</code> ou apelido — Propor troca e escolher cartas pelos botões\n"
+        "• /doar <code>@pessoa</code> ou apelido — Doar cartas pelo menu de botões\n"
+        "• /wishlist [@pessoa ou apelido] — Ver e editar sua wishlist ou consultar a de alguém\n"
+        "• /loja — Vender cartas por AquaBubbles e comprar giros\n"
         "• /meuid — Ver seu ID numérico do Telegram"
     ),
     "menu_girar": (
@@ -452,7 +455,8 @@ def iniciar_banco():
             nome TEXT,
             apelido TEXT,
             giros_restantes INTEGER DEFAULT 10,
-            ultimo_reset TEXT
+            ultimo_reset TEXT,
+            aqua_coins INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS cartas (
             id SERIAL PRIMARY KEY,
@@ -479,7 +483,15 @@ def iniciar_banco():
             carta_pedida_id INTEGER NOT NULL,
             status TEXT DEFAULT 'pendente'
         );
+        CREATE TABLE IF NOT EXISTS wishlists (
+            user_id BIGINT NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+            carta_id INTEGER NOT NULL REFERENCES cartas(id) ON DELETE CASCADE,
+            criada_em TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, carta_id)
+        );
     """)
+
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aqua_coins INTEGER NOT NULL DEFAULT 0;")
 
     cur.execute("""
         SELECT 1 FROM information_schema.columns
@@ -812,6 +824,18 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verificar_usuario(user.id, user.username)
     texto = obter_texto_publico("comandos_texto")
+    comandos_novos = [
+        ("/trocar", "• /trocar <code>@pessoa</code> ou apelido — Propor troca escolhendo cartas pelos botões"),
+        ("/doar", "• /doar <code>@pessoa</code> ou apelido — Doar cartas com botões"),
+        ("/wishlist", "• /wishlist [pessoa] — Editar sua wishlist ou consultar a de alguém"),
+        ("/loja", "• /loja — Vender cartas por AquaBubbles e comprar giros"),
+    ]
+    linhas_ausentes = [
+        linha for comando, linha in comandos_novos
+        if (comando not in texto or (comando == "/trocar" and "@pessoa" not in texto))
+    ]
+    if linhas_ausentes:
+        texto = f"{texto.rstrip()}\n" + "\n".join(linhas_ausentes)
     await msg.reply_text(texto, parse_mode="HTML")
 
 async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1468,14 +1492,22 @@ async def _processar_giros_core(
                 linhas.append(f"{em} <code>#{cid}</code> <b>{esc(c_nome)}</b> <i>[{t_c}]</i>{vezes_txt}{tag_nova}")
 
             legenda = "\n".join(linhas)
-            await enviar_midia_carta(
-                reply_anchor,
-                d_file,
-                d_media,
-                f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{d_id} {esc(d_nome)}</b> <i>[{destaque_info['curto']}]</i>",
-                bot=bot,
-            )
-            await enviar_texto_seguro(chat_id, legenda, bot, thread_id=thread_id)
+            legenda_resultado = legenda
+            if len(legenda_resultado) > 1000:
+                compacto = linhas[:2]
+                usados = sum(len(item) + 1 for item in compacto)
+                omitidos = 0
+                itens = linhas[2:]
+                for indice, item in enumerate(itens):
+                    if usados + len(item) + 1 > 940:
+                        omitidos = len(itens) - indice
+                        break
+                    compacto.append(item)
+                    usados += len(item) + 1
+                if omitidos:
+                    compacto.append(f"<i>… e mais {omitidos} resultado(s)</i>")
+                legenda_resultado = "\n".join(compacto)
+            await enviar_midia_carta(reply_anchor, d_file, d_media, legenda_resultado, bot=bot)
             await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id)
 
         if menu_message:
@@ -2034,6 +2066,323 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas.append("\n<i>Use /artista nome para ver detalhes ou /ranking nome para ver o top jogadores.</i>")
     await msg.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
 
+def _montar_wishlist(user_id: int, dono_id: int | None = None):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.id, c.nome, c.tier
+        FROM wishlists w JOIN cartas c ON c.id = w.carta_id
+        WHERE w.user_id = %s ORDER BY c.nome, c.tier, c.id
+    """, (user_id,))
+    itens = cur.fetchall()
+    cur.execute("SELECT apelido, username FROM usuarios WHERE user_id = %s", (user_id,))
+    pessoa = cur.fetchone()
+    cur.close()
+    conn.close()
+    nome = pessoa[0] if pessoa and pessoa[0] else (f"@{pessoa[1]}" if pessoa and pessoa[1] else f"Mixer #{str(user_id)[-4:]}")
+    linhas = [f"💧 <b>Wishlist de {esc(nome)}</b>\n"]
+    if itens:
+        linhas.extend(f"• <code>#{cid}</code> {esc(carta_nome)} (T{tier})" for cid, carta_nome, tier in itens)
+    else:
+        linhas.append("<i>A wishlist está vazia.</i>")
+    botoes = []
+    if dono_id == user_id:
+        botoes.append([
+            InlineKeyboardButton("➕ Adicionar carta", callback_data="wish|addpage|0"),
+            InlineKeyboardButton("➖ Remover carta", callback_data="wish|rempage|0"),
+        ])
+        botoes.append([InlineKeyboardButton("🔄 Atualizar", callback_data="wish|home")])
+    else:
+        for cid, carta_nome, _ in itens[:20]:
+            botoes.append([InlineKeyboardButton(f"Ver #{cid} {carta_nome[:35]}", callback_data=f"wish|show|{cid}")])
+    return "\n".join(linhas)[:4000], InlineKeyboardMarkup(botoes) if botoes else None
+
+async def cmd_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    verificar_usuario(user.id, user.username)
+    identificador = " ".join(context.args).strip()
+    if identificador:
+        pessoa = _resolver_jogador(identificador)
+        if not pessoa:
+            await msg.reply_text("Não encontrei esse jogador. Ele precisa ter iniciado o bot antes.")
+            return
+        alvo_id = pessoa[0]
+    else:
+        alvo_id = user.id
+    texto, markup = _montar_wishlist(alvo_id, dono_id=user.id if alvo_id == user.id else None)
+    context.user_data["wishlist_owner_id"] = user.id
+    await msg.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+
+async def callback_wishlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "show":
+        carta_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT file_id, media_type, nome, tier FROM cartas WHERE id = %s", (carta_id,))
+        carta = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not carta:
+            await query.answer("Carta não encontrada.", show_alert=True)
+            return
+        await query.answer()
+        legenda = f"💧 <b>Wishlist:</b> #{carta_id} {esc(carta[2])} (Tier {carta[3]})"
+        await enviar_midia_carta(query.message, carta[0], carta[1], legenda, bot=context.bot)
+        return
+
+    if context.user_data.get("wishlist_owner_id") != query.from_user.id:
+        await query.answer("Abra sua wishlist com /wishlist para usar esses botões.", show_alert=True)
+        return
+    if acao == "home":
+        texto, markup = _montar_wishlist(query.from_user.id, dono_id=query.from_user.id)
+        await query.answer()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return
+    if acao in ("addpage", "rempage"):
+        page = int(partes[2])
+        page_size = 12
+        conn = get_db()
+        cur = conn.cursor()
+        if acao == "addpage":
+            cur.execute("""
+                SELECT COUNT(*) FROM cartas c
+                WHERE NOT EXISTS (SELECT 1 FROM wishlists w WHERE w.user_id = %s AND w.carta_id = c.id)
+            """, (query.from_user.id,))
+            total = cur.fetchone()[0]
+            cur.execute("""
+                SELECT c.id, c.nome, c.tier FROM cartas c
+                WHERE NOT EXISTS (SELECT 1 FROM wishlists w WHERE w.user_id = %s AND w.carta_id = c.id)
+                ORDER BY c.nome, c.tier, c.id LIMIT %s OFFSET %s
+            """, (query.from_user.id, page_size, page * page_size))
+        else:
+            cur.execute("SELECT COUNT(*) FROM wishlists WHERE user_id = %s", (query.from_user.id,))
+            total = cur.fetchone()[0]
+            cur.execute("""
+                SELECT c.id, c.nome, c.tier FROM wishlists w JOIN cartas c ON c.id = w.carta_id
+                WHERE w.user_id = %s ORDER BY c.nome, c.tier, c.id LIMIT %s OFFSET %s
+            """, (query.from_user.id, page_size, page * page_size))
+        itens = cur.fetchall()
+        cur.close()
+        conn.close()
+        total_paginas = max(1, (total + page_size - 1) // page_size)
+        botoes = []
+        linha = []
+        for cid, nome, tier in itens:
+            label = f"#{cid} {nome[:28]} T{tier}"
+            linha.append(InlineKeyboardButton(label, callback_data=f"wish|{'add' if acao == 'addpage' else 'remove'}|{cid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        if total_paginas > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("⬅️", callback_data=f"wish|{acao}|{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{min(page + 1, total_paginas)}/{total_paginas}", callback_data="wish|noop"))
+            if page + 1 < total_paginas:
+                nav.append(InlineKeyboardButton("➡️", callback_data=f"wish|{acao}|{page + 1}"))
+            botoes.append(nav)
+        botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="wish|home")])
+        texto = "Escolha uma carta para adicionar à wishlist:" if acao == "addpage" else "Escolha uma carta para remover da wishlist:"
+        await query.answer()
+        await query.edit_message_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+        return
+    if acao == "noop":
+        await query.answer()
+        return
+    if acao in ("add", "remove"):
+        carta_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        if acao == "add":
+            cur.execute("INSERT INTO wishlists (user_id, carta_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (query.from_user.id, carta_id))
+        else:
+            cur.execute("DELETE FROM wishlists WHERE user_id = %s AND carta_id = %s", (query.from_user.id, carta_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        texto, markup = _montar_wishlist(query.from_user.id, dono_id=query.from_user.id)
+        await query.answer("Wishlist atualizada.")
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+
+async def cmd_loja(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    verificar_usuario(user.id, user.username)
+    context.user_data["loja_owner"] = user.id
+    await _mostrar_menu_loja(msg, user.id)
+
+async def _mostrar_menu_loja(msg, user_id: int, editar: bool = False):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT aqua_coins, giros_restantes FROM usuarios WHERE user_id = %s", (user_id,))
+    row = cur.fetchone() or (0, 0)
+    cur.close()
+    conn.close()
+    texto = (
+        "🫧 <b>AquaBubbles</b>\n\n"
+        f"Saldo: <b>{row[0]}</b> AquaBubbles\n"
+        f"Giros: <b>{row[1]}</b>\n\n"
+        "Venda cartas por 1 AquaBubble cada. Cada giro custa 10 AquaBubbles."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💿 Vender cartas", callback_data="loja|vender")],
+        [InlineKeyboardButton("🎲 Comprar giros", callback_data="loja|comprar")],
+    ])
+    if editar:
+        await msg.edit_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await msg.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+
+async def callback_loja(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = context.user_data.get("loja_owner")
+    if user_id != query.from_user.id:
+        await query.answer("Abra /loja para usar seus botões.", show_alert=True)
+        return
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "vender":
+        _, markup, _, total = _montar_botoes_inventario(user_id, "loja")
+        if total == 0:
+            await query.answer("Sua coleção está vazia.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text("Escolha a carta que quer vender ao bot:", reply_markup=markup)
+        return
+    if acao == "page":
+        _, markup, _, _ = _montar_botoes_inventario(user_id, "loja", int(partes[2]))
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=markup)
+        return
+    if acao == "noop":
+        await query.answer()
+        return
+    if acao == "card":
+        carta_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT c.nome, c.tier, SUM(i.quantidade) FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s GROUP BY c.id, c.nome, c.tier HAVING SUM(i.quantidade)>0", (carta_id, user_id))
+        carta = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not carta:
+            await query.answer("Essa carta não está mais na sua coleção.", show_alert=True)
+            return
+        max_qtd = carta[2]
+        quantidades = sorted({n for n in (1, 2, 3, 5, 10, max_qtd) if n <= max_qtd})
+        botoes = []
+        linha = []
+        for qtd in quantidades:
+            linha.append(InlineKeyboardButton(f"Vender {qtd} (+{qtd} 🫧)", callback_data=f"loja|venderq|{carta_id}|{qtd}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="loja|vender")])
+        await query.answer()
+        await query.edit_message_text(
+            f"Você tem {max_qtd}x <b>{esc(carta[0])}</b>. Cada cópia rende 1 AquaBubble. Quantas vai vender?",
+            reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML",
+        )
+        return
+    if acao == "venderq":
+        carta_id, quantidade = int(partes[2]), int(partes[3])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM usuarios WHERE user_id = %s FOR UPDATE", (user_id,))
+        cur.fetchone()
+        if not _retirar_inventario(cur, user_id, carta_id, quantidade):
+            conn.rollback()
+            cur.close()
+            conn.close()
+            await query.answer("Você não tem mais essa quantidade.", show_alert=True)
+            return
+        cur.execute("UPDATE usuarios SET aqua_coins = aqua_coins + %s WHERE user_id = %s RETURNING aqua_coins", (quantidade, user_id))
+        saldo = cur.fetchone()[0]
+        cur.execute("SELECT nome FROM cartas WHERE id = %s", (carta_id,))
+        nome = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Venda concluída!")
+        await query.edit_message_text(f"✅ Vendido: {quantidade}x <b>{esc(nome)}</b>. Você recebeu <b>{quantidade}</b> AquaBubbles.\nSaldo: <b>{saldo}</b> 🫧", parse_mode="HTML")
+        return
+    if acao == "comprar":
+        verificar_usuario(user_id, query.from_user.username)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT aqua_coins FROM usuarios WHERE user_id = %s", (user_id,))
+        moedas = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        max_giros = moedas // 10
+        if max_giros < 1:
+            await query.answer("Você precisa de 10 AquaBubbles para comprar um giro.", show_alert=True)
+            return
+        quantidades = [n for n in (1, 3, 5, 10) if n <= max_giros]
+        botoes = []
+        linha = []
+        for qtd in quantidades:
+            linha.append(InlineKeyboardButton(f"{qtd} giro(s) • {qtd * 10} 🫧", callback_data=f"loja|comprarq|{qtd}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        if max_giros not in quantidades:
+            botoes.append([InlineKeyboardButton(f"Máximo ({max_giros} giros)", callback_data="loja|comprarmax")])
+        botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="loja|menu")])
+        await query.answer()
+        await query.edit_message_text(
+            f"Cada giro custa 10 AquaBubbles. Seu saldo permite até {max_giros} giro(s). Quantos quer comprar?",
+            reply_markup=InlineKeyboardMarkup(botoes),
+        )
+        return
+    if acao in ("comprarq", "comprarmax"):
+        qtd = None if acao == "comprarmax" else int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT aqua_coins, giros_restantes FROM usuarios WHERE user_id = %s FOR UPDATE", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            await query.answer("Conta não encontrada.", show_alert=True)
+            return
+        moedas, giros = row
+        if acao == "comprarmax":
+            qtd = moedas // 10
+        if qtd < 1 or moedas < qtd * 10:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            await query.answer("Saldo insuficiente para essa compra.", show_alert=True)
+            return
+        saldo = moedas - qtd * 10
+        total_giros = giros + qtd
+        cur.execute("UPDATE usuarios SET aqua_coins = %s, giros_restantes = %s WHERE user_id = %s", (saldo, total_giros, user_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Giros comprados!")
+        await query.edit_message_text(f"✅ Comprou {qtd} giro(s) por {qtd * 10} AquaBubbles.\nSaldo: {saldo} 🫧 • Giros disponíveis: {total_giros} 🎲", parse_mode="HTML")
+        return
+    if acao == "menu":
+        await query.answer()
+        await _mostrar_menu_loja(query.message, user_id, editar=True)
+
 async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg:
@@ -2078,104 +2427,238 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # SISTEMA DE TROCAS (JOGADORES)
 # ==========================================
+def _resolver_jogador(identificador: str):
+    valor = identificador.strip().lstrip("@").strip()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, username, apelido FROM usuarios WHERE LOWER(username) = LOWER(%s) OR LOWER(TRIM(apelido)) = LOWER(%s) LIMIT 1",
+        (valor, valor),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+def _montar_botoes_inventario(user_id: int, prefixo: str, page: int = 0, itens_por_pagina: int = 10):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT carta_id FROM inventario WHERE user_id = %s GROUP BY carta_id HAVING SUM(quantidade) > 0
+        ) itens
+    """, (user_id,))
+    total = cur.fetchone()[0]
+    total_paginas = max(1, (total + itens_por_pagina - 1) // itens_por_pagina)
+    page = max(0, min(page, total_paginas - 1))
+    cur.execute("""
+        SELECT c.id, c.nome, c.tier, SUM(i.quantidade)
+        FROM inventario i JOIN cartas c ON c.id = i.carta_id
+        WHERE i.user_id = %s
+        GROUP BY c.id, c.nome, c.tier
+        HAVING SUM(i.quantidade) > 0
+        ORDER BY c.nome, c.tier, c.id
+        LIMIT %s OFFSET %s
+    """, (user_id, itens_por_pagina, page * itens_por_pagina))
+    itens = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    botoes = []
+    linha = []
+    for carta_id, nome, tier, quantidade in itens:
+        titulo = f"#{carta_id} {nome[:27]} T{tier} ×{quantidade}"
+        linha.append(InlineKeyboardButton(titulo, callback_data=f"{prefixo}|card|{carta_id}|{page}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    if total_paginas > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefixo}|page|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_paginas}", callback_data=f"{prefixo}|noop"))
+        if page + 1 < total_paginas:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefixo}|page|{page + 1}"))
+        botoes.append(nav)
+    botoes.append([InlineKeyboardButton("Cancelar", callback_data=f"{prefixo}|cancel")])
+    return itens, InlineKeyboardMarkup(botoes), page, total
+
+def _retirar_inventario(cur, user_id: int, carta_id: int, quantidade: int) -> bool:
+    cur.execute(
+        "SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s ORDER BY id FOR UPDATE",
+        (user_id, carta_id),
+    )
+    rows = cur.fetchall()
+    total = sum(q or 0 for _, q in rows)
+    if quantidade < 1 or total < quantidade:
+        return False
+    restante = total - quantidade
+    if restante:
+        cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (restante, rows[0][0]))
+        extras = [row_id for row_id, _ in rows[1:]]
+        if extras:
+            cur.execute("DELETE FROM inventario WHERE id = ANY(%s)", (extras,))
+    else:
+        cur.execute("DELETE FROM inventario WHERE user_id = %s AND carta_id = %s", (user_id, carta_id))
+    return True
+
+def _adicionar_inventario(cur, user_id: int, carta_id: int, quantidade: int):
+    cur.execute(
+        "SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s ORDER BY id FOR UPDATE",
+        (user_id, carta_id),
+    )
+    rows = cur.fetchall()
+    if rows:
+        cur.execute(
+            "UPDATE inventario SET quantidade = %s WHERE id = %s",
+            (sum(q or 0 for _, q in rows) + quantidade, rows[0][0]),
+        )
+        extras = [row_id for row_id, _ in rows[1:]]
+        if extras:
+            cur.execute("DELETE FROM inventario WHERE id = ANY(%s)", (extras,))
+    else:
+        cur.execute(
+            "INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, %s)",
+            (user_id, carta_id, quantidade),
+        )
+
 async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     remetente = update.effective_user
     if not msg or not remetente:
         return
-
     verificar_usuario(remetente.id, remetente.username)
-    rem_apelido, _ = obter_apelido(remetente.id, remetente.username)
-
-    destinatario_id = None
-    destinatario_apelido = None
-
-    if msg.reply_to_message and len(context.args) >= 2:
+    identificador = " ".join(context.args).strip()
+    if not identificador and msg.reply_to_message and msg.reply_to_message.from_user:
         alvo = msg.reply_to_message.from_user
-        if not alvo or alvo.is_bot or alvo.id == remetente.id:
-            await msg.reply_text("Responda à mensagem de outro jogador válido.")
-            return
-        destinatario_id = alvo.id
-        verificar_usuario(destinatario_id, alvo.username)
-        destinatario_apelido, _ = obter_apelido(destinatario_id, alvo.username)
-        id_str_1, id_str_2 = context.args[0], context.args[1]
-    elif len(context.args) >= 3 and context.args[0].startswith("@"):
-        uname = context.args[0].lstrip("@").lower()
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM usuarios WHERE username = %s", (uname,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not row:
-            await msg.reply_text("Jogador não encontrado. Peça para ele usar /girar primeiro ou responda uma mensagem dele.")
-            return
-        destinatario_id = row[0]
-        if destinatario_id == remetente.id:
-            await msg.reply_text("Você não pode trocar cartas consigo mesmo.")
-            return
-        destinatario_apelido, _ = obter_apelido(destinatario_id, uname)
-        id_str_1, id_str_2 = context.args[1], context.args[2]
-    else:
+        identificador = alvo.username or obter_apelido(alvo.id, alvo.username)[0]
+    if not identificador:
         await msg.reply_text(
-            "Uso:\n"
-            "• Responda à mensagem da pessoa: <code>/trocar SUA_ID ID_DELE</code>\n"
-            "• Ou use: <code>/trocar @usuario SUA_ID ID_DELE</code>",
+            "Use <code>/trocar @usuario</code> ou <code>/trocar apelido</code>. Depois escolha as cartas pelos botões.",
             parse_mode="HTML"
         )
         return
-
-    try:
-        c_oferecida = int(id_str_1.replace("#", ""))
-        c_pedida = int(id_str_2.replace("#", ""))
-    except ValueError:
-        await msg.reply_text("Os IDs das cartas devem ser números.")
+    destinatario = _resolver_jogador(identificador)
+    if not destinatario:
+        await msg.reply_text("Não encontrei esse jogador. Ele precisa ter iniciado o bot antes.")
         return
+    destinatario_id, target_username, target_alias = destinatario
+    if destinatario_id == remetente.id:
+        await msg.reply_text("Você não pode trocar cartas consigo mesmo.")
+        return
+    itens, markup, _, total = _montar_botoes_inventario(remetente.id, "tradeui")
+    if total == 0:
+        await msg.reply_text("Sua coleção está vazia; não há carta para oferecer.")
+        return
+    context.user_data["tradeui"] = {
+        "sender_id": remetente.id,
+        "target_id": destinatario_id,
+        "target_name": (target_alias or (f"@{target_username}" if target_username else str(destinatario_id))),
+    }
+    await msg.reply_text(
+        f"Escolha a carta que você oferece para <b>{esc(context.user_data['tradeui']['target_name'])}</b>:",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (remetente.id, c_oferecida))
-    p1 = cur.fetchone()
-    cur.execute("SELECT quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (destinatario_id, c_pedida))
-    p2 = cur.fetchone()
+async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    fluxo = context.user_data.get("tradeui")
+    if not fluxo or fluxo.get("sender_id") != query.from_user.id:
+        await query.answer("Esse menu de troca expirou.", show_alert=True)
+        return
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "cancel":
+        context.user_data.pop("tradeui", None)
+        await query.answer("Cancelado.")
+        await query.edit_message_text("Proposta de troca cancelada.")
+        return
+    if acao == "noop":
+        await query.answer()
+        return
+    if acao == "page":
+        dono_lista = fluxo["target_id"] if fluxo.get("offered_id") else query.from_user.id
+        itens, markup, _, total = _montar_botoes_inventario(dono_lista, "tradeui", int(partes[2]))
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=markup)
+        return
+    if acao == "card":
+        carta_id = int(partes[2])
+        if not fluxo.get("offered_id"):
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("SELECT c.nome, c.tier FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (carta_id, query.from_user.id))
+            carta = cur.fetchone()
+            cur.close()
+            conn.close()
+            if not carta:
+                await query.answer("Essa carta não está mais na sua coleção.", show_alert=True)
+                return
+            fluxo["offered_id"] = carta_id
+            _, markup, _, total = _montar_botoes_inventario(fluxo["target_id"], "tradeui")
+            if total == 0:
+                await query.answer("Essa pessoa ainda não tem cartas para trocar.", show_alert=True)
+                context.user_data.pop("tradeui", None)
+                await query.edit_message_text("Troca cancelada: o destinatário ainda não possui cartas.")
+                return
+            await query.answer("Carta oferecida selecionada.")
+            await query.edit_message_text(
+                f"Você oferece <b>{esc(carta[0])}</b> (Tier {carta[1]}). Escolha a carta que deseja receber de <b>{esc(fluxo['target_name'])}</b>:",
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            return
 
-    if not p1 or p1[0] < 1:
-        await msg.reply_text(f"Você não possui a carta <code>#{c_oferecida}</code>.", parse_mode="HTML")
+        pedido_id = carta_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT c.nome, c.tier FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (pedido_id, fluxo["target_id"]))
+        pedida = cur.fetchone()
+        cur.execute("SELECT nome, tier FROM cartas WHERE id = %s", (fluxo["offered_id"],))
+        oferecida = cur.fetchone()
+        if not pedida or not oferecida:
+            cur.close()
+            conn.close()
+            await query.answer("Uma das cartas não está mais disponível.", show_alert=True)
+            context.user_data.pop("tradeui", None)
+            return
+        cur.execute(
+            "INSERT INTO trocas (remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id) VALUES (%s, %s, %s, %s) RETURNING id",
+            (query.from_user.id, fluxo["target_id"], fluxo["offered_id"], pedido_id),
+        )
+        troca_id = cur.fetchone()[0]
+        conn.commit()
         cur.close()
         conn.close()
-        return
-    if not p2 or p2[0] < 1:
-        await msg.reply_text(f"{esc(destinatario_apelido)} não possui a carta <code>#{c_pedida}</code>.", parse_mode="HTML")
-        cur.close()
-        conn.close()
-        return
 
-    cur.execute("SELECT nome, tier FROM cartas WHERE id = %s", (c_oferecida,))
-    info1 = cur.fetchone()
-    cur.execute("SELECT nome, tier FROM cartas WHERE id = %s", (c_pedida,))
-    info2 = cur.fetchone()
-
-    cur.execute(
-        "INSERT INTO trocas (remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id) VALUES (%s, %s, %s, %s) RETURNING id",
-        (remetente.id, destinatario_id, c_oferecida, c_pedida)
-    )
-    troca_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    botoes = [[
-        InlineKeyboardButton("✅ Aceitar Troca", callback_data=f"trade|aceitar|{troca_id}"),
-        InlineKeyboardButton("❌ Recusar", callback_data=f"trade|recusar|{troca_id}")
-    ]]
-    texto = (
-        f"🔄 <b>Proposta de Troca #{troca_id}</b>\n\n"
-        f"🫧 <b>{esc(rem_apelido)}</b> oferece:\n"
-        f"   💿 <code>#{c_oferecida}</code> — {esc(info1[0])} (Tier {info1[1]})\n\n"
-        f"🫧 Para <b>{esc(destinatario_apelido)}</b> em troca de:\n"
-        f"   💿 <code>#{c_pedida}</code> — {esc(info2[0])} (Tier {info2[1]})"
-    )
-    await msg.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+        apelido_sender, _ = obter_apelido(query.from_user.id, query.from_user.username)
+        texto = (
+            f"🔄 <b>Proposta de troca #{troca_id}</b>\n\n"
+            f"🫧 <b>{esc(apelido_sender)}</b> oferece <b>{esc(oferecida[0])}</b> (Tier {oferecida[1]})\n"
+            f"em troca de <b>{esc(pedida[0])}</b> (Tier {pedida[1]})."
+        )
+        botoes = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Aceitar", callback_data=f"trade|aceitar|{troca_id}"),
+            InlineKeyboardButton("❌ Recusar", callback_data=f"trade|recusar|{troca_id}"),
+        ]])
+        try:
+            await context.bot.send_message(chat_id=fluxo["target_id"], text=texto, reply_markup=botoes, parse_mode="HTML")
+        except Exception:
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("UPDATE trocas SET status = 'cancelada' WHERE id = %s", (troca_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            await query.answer("Não consegui enviar a proposta. Peça ao destinatário para abrir o bot com /start.", show_alert=True)
+            context.user_data.pop("tradeui", None)
+            return
+        context.user_data.pop("tradeui", None)
+        await query.answer("Proposta enviada.")
+        await query.edit_message_text(f"✅ Proposta de troca enviada para <b>{esc(fluxo['target_name'])}</b>.", parse_mode="HTML")
 
 async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2184,7 +2667,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, status FROM trocas WHERE id = %s", (troca_id,))
+    cur.execute("SELECT remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, status FROM trocas WHERE id = %s FOR UPDATE", (troca_id,))
     troca = cur.fetchone()
 
     if not troca or troca[4] != "pendente":
@@ -2196,8 +2679,8 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rem_id, dest_id, c_oferecida, c_pedida, _ = troca
 
     if acao == "recusar":
-        if query.from_user.id not in (rem_id, dest_id):
-            await query.answer("Apenas os envolvidos podem cancelar.", show_alert=True)
+        if query.from_user.id != dest_id:
+            await query.answer("Apenas o destinatário pode recusar essa proposta.", show_alert=True)
             cur.close()
             conn.close()
             return
@@ -2215,12 +2698,9 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
-    cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (rem_id, c_oferecida))
-    inv_rem = cur.fetchone()
-    cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (dest_id, c_pedida))
-    inv_dest = cur.fetchone()
-
-    if not inv_rem or inv_rem[1] < 1 or not inv_dest or inv_dest[1] < 1:
+    cur.execute("SAVEPOINT trade_transfer")
+    if not _retirar_inventario(cur, rem_id, c_oferecida, 1) or not _retirar_inventario(cur, dest_id, c_pedida, 1):
+        cur.execute("ROLLBACK TO SAVEPOINT trade_transfer")
         cur.execute("UPDATE trocas SET status = 'cancelada' WHERE id = %s", (troca_id,))
         conn.commit()
         cur.close()
@@ -2228,22 +2708,10 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Falta uma das cartas no inventário!", show_alert=True)
         await query.edit_message_text(f"⚠️ Troca #{troca_id} cancelada por falta de cartas.")
         return
+    cur.execute("RELEASE SAVEPOINT trade_transfer")
 
-    def transferir(para_user, carta_id, inv_row):
-        if inv_row[1] == 1:
-            cur.execute("DELETE FROM inventario WHERE id = %s", (inv_row[0],))
-        else:
-            cur.execute("UPDATE inventario SET quantidade = quantidade - 1 WHERE id = %s", (inv_row[0],))
-
-        cur.execute("SELECT id FROM inventario WHERE user_id = %s AND carta_id = %s", (para_user, carta_id))
-        dest_row = cur.fetchone()
-        if dest_row:
-            cur.execute("UPDATE inventario SET quantidade = quantidade + 1 WHERE id = %s", (dest_row[0],))
-        else:
-            cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (para_user, carta_id))
-
-    transferir(dest_id, c_oferecida, inv_rem)
-    transferir(rem_id, c_pedida, inv_dest)
+    _adicionar_inventario(cur, dest_id, c_oferecida, 1)
+    _adicionar_inventario(cur, rem_id, c_pedida, 1)
     cur.execute("UPDATE trocas SET status = 'aceita' WHERE id = %s", (troca_id,))
     conn.commit()
     cur.close()
@@ -2251,6 +2719,122 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer("Troca concluída!")
     await query.edit_message_text(f"✅ <b>Troca #{troca_id} concluída!</b>", parse_mode="HTML")
+
+async def cmd_doar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    verificar_usuario(user.id, user.username)
+    identificador = " ".join(context.args).strip()
+    if not identificador and msg.reply_to_message and msg.reply_to_message.from_user:
+        alvo = msg.reply_to_message.from_user
+        identificador = alvo.username or obter_apelido(alvo.id, alvo.username)[0]
+    if not identificador:
+        await msg.reply_text("Use <code>/doar @usuario</code> ou <code>/doar apelido</code> e escolha a carta e a quantidade nos botões.", parse_mode="HTML")
+        return
+    destinatario = _resolver_jogador(identificador)
+    if not destinatario:
+        await msg.reply_text("Não encontrei esse jogador. Ele precisa ter iniciado o bot antes.")
+        return
+    destino_id, username, apelido = destinatario
+    if destino_id == user.id:
+        await msg.reply_text("Você não pode doar cartas para si mesmo.")
+        return
+    itens, markup, _, total = _montar_botoes_inventario(user.id, "doarui")
+    if total == 0:
+        await msg.reply_text("Sua coleção está vazia; não há carta para doar.")
+        return
+    nome_destino = apelido or (f"@{username}" if username else str(destino_id))
+    context.user_data["doarui"] = {"sender_id": user.id, "target_id": destino_id, "target_name": nome_destino}
+    await msg.reply_text(f"Escolha a carta que deseja doar para <b>{esc(nome_destino)}</b>:", reply_markup=markup, parse_mode="HTML")
+
+async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    fluxo = context.user_data.get("doarui")
+    if not fluxo or fluxo.get("sender_id") != query.from_user.id:
+        await query.answer("Esse menu de doação expirou.", show_alert=True)
+        return
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "cancel":
+        context.user_data.pop("doarui", None)
+        await query.answer("Cancelado.")
+        await query.edit_message_text("Doação cancelada.")
+        return
+    if acao == "noop":
+        await query.answer()
+        return
+    if acao == "page":
+        dono_lista = query.from_user.id if not fluxo.get("carta_id") else query.from_user.id
+        _, markup, _, _ = _montar_botoes_inventario(dono_lista, "doarui", int(partes[2]))
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=markup)
+        return
+    if acao == "card":
+        carta_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT c.nome, c.tier, SUM(i.quantidade) FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s GROUP BY c.id, c.nome, c.tier HAVING SUM(i.quantidade)>0", (carta_id, query.from_user.id))
+        carta = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not carta:
+            await query.answer("Essa carta não está mais na sua coleção.", show_alert=True)
+            return
+        fluxo["carta_id"] = carta_id
+        fluxo["carta_nome"] = carta[0]
+        fluxo["max_qtd"] = carta[2]
+        valores = sorted({min(n, carta[2]) for n in (1, 2, 3, 5, 10) if carta[2] >= n})
+        valores.append(carta[2])
+        botoes = []
+        linha = []
+        for qtd in dict.fromkeys(valores):
+            linha.append(InlineKeyboardButton(f"Doar {qtd}", callback_data=f"doarui|qty|{qtd}"))
+            if len(linha) == 3:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("Cancelar", callback_data="doarui|cancel")])
+        await query.answer()
+        await query.edit_message_text(
+            f"Quantas cópias de <b>{esc(carta[0])}</b> deseja doar? Você tem {carta[2]}.",
+            reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML",
+        )
+        return
+    if acao == "qty":
+        quantidade = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM cartas WHERE id = %s", (fluxo["carta_id"],))
+        carta = cur.fetchone()
+        sucesso = carta and _retirar_inventario(cur, query.from_user.id, fluxo["carta_id"], quantidade)
+        if not sucesso:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            await query.answer("Você não tem mais essa quantidade.", show_alert=True)
+            context.user_data.pop("doarui", None)
+            return
+        _adicionar_inventario(cur, fluxo["target_id"], fluxo["carta_id"], quantidade)
+        conn.commit()
+        cur.close()
+        conn.close()
+        nome_destino = fluxo["target_name"]
+        avisou_destinatario = True
+        try:
+            await context.bot.send_message(
+                chat_id=fluxo["target_id"],
+                text=f"🎁 Você recebeu {quantidade}x <b>{esc(carta[0])}</b> de <b>{esc(obter_apelido(query.from_user.id, query.from_user.username)[0])}</b>!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            avisou_destinatario = False
+        context.user_data.pop("doarui", None)
+        await query.answer("Doação concluída!")
+        aviso = "" if avisou_destinatario else "\nNão consegui avisar em particular; peça para a pessoa abrir o bot com /start."
+        await query.edit_message_text(f"✅ Você doou {quantidade}x <b>{esc(carta[0])}</b> para <b>{esc(nome_destino)}</b>.{aviso}", parse_mode="HTML")
 
 # ==========================================
 # ASSISTENTE INTERATIVO /addcarta (SUPORTE A 3 NÍVEIS)
@@ -5369,6 +5953,9 @@ async def main():
     app.add_handler(CommandHandler("colecao", cmd_colecao))
     app.add_handler(CommandHandler("carta", cmd_carta))
     app.add_handler(CommandHandler("trocar", cmd_trocar))
+    app.add_handler(CommandHandler("doar", cmd_doar))
+    app.add_handler(CommandHandler("wishlist", cmd_wishlist))
+    app.add_handler(CommandHandler("loja", cmd_loja))
 
     # Comandos de Admin (Studio)
     app.add_handler(CommandHandler("studio", cmd_studio_help))
@@ -5395,6 +5982,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_catalogo, pattern=r"^catlist\|"))
     app.add_handler(CallbackQueryHandler(cmd_catalogo, pattern=r"^studio_go\|catalogo$"))
     app.add_handler(CallbackQueryHandler(callback_troca, pattern=r"^trade\|"))
+    app.add_handler(CallbackQueryHandler(callback_troca_ui, pattern=r"^tradeui\|"))
+    app.add_handler(CallbackQueryHandler(callback_doarui, pattern=r"^doarui\|"))
+    app.add_handler(CallbackQueryHandler(callback_wishlist, pattern=r"^wish\|"))
+    app.add_handler(CallbackQueryHandler(callback_loja, pattern=r"^loja\|"))
 
     # Listener de quantidade personalizada de giros (group=1 para não conflitar com wizards admin)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_custom_spin_texto), group=1)
@@ -5440,6 +6031,9 @@ async def main():
         BotCommand("ranking", "Ver ranking de jogadores de um artista"),
         BotCommand("carta", "Visualizar uma carta pelo ID"),
         BotCommand("trocar", "Propor troca de cartas"),
+        BotCommand("doar", "Doar cartas por botões"),
+        BotCommand("wishlist", "Editar ou consultar wishlist"),
+        BotCommand("loja", "Vender cartas e comprar giros"),
         BotCommand("meuid", "Ver seu ID numérico"),
     ])
 
