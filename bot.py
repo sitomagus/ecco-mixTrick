@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import html
 import random
 import asyncio
@@ -46,6 +47,73 @@ TIERS_CONFIG = {
     3: {"nome": "Tier 3 (Raro)", "curto": "Tier 3", "emoji": "🦋", "peso": 15},
     4: {"nome": "Tier 4 (Épico)", "curto": "Tier 4", "emoji": "🔮", "peso": 7},
     5: {"nome": "Tier 5 (Lendário)", "curto": "Tier 5", "emoji": "💠", "peso": 3},
+}
+
+TEXTOS_PADRAO = {
+    "start_texto": (
+        "🌐 <b>Ecco-Mix Trick</b>\n"
+        "🫧 Jogador: <b>{apelido}</b>\n"
+        "🍃 Giros disponíveis hoje: <b>{giros}</b>\n\n"
+        "<b>Comandos disponíveis:</b>\n"
+        "• /girar — Escolher uma categoria e sortear uma carta (ou <code>/girar tudo</code>)\n"
+        "• /apelido <code>nome</code> — Definir seu nome único de exibição no jogo\n"
+        "• /colecao — Ver toda a sua coleção agrupada\n"
+        "• /catalogo — Ver todas as cartas cadastradas por categoria\n"
+        "• /artista <code>nome</code> — Ver seu progresso nos 5 tiers de um artista/personagem\n"
+        "• /ranking <code>nome</code> — Ver ranking de jogadores de um artista/personagem\n"
+        "• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
+        "• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
+        "• /meuid — Ver seu ID numérico do Telegram"
+        "{dica_apelido}"
+        "{studio}"
+    ),
+    "menu_girar": (
+        "🫧 <b>{apelido}</b> • 🍃 Giros restantes: <b>{giros}</b>\n"
+        "Escolha a categoria:"
+    ),
+    "giro_resultado": (
+        "🌐 <b>MIX SINTONIZADO! Você desbloqueou:</b>\n\n"
+        "{tier_emoji} <b>{carta_id}. {nome}.</b> <i>[{tier_curto}]</i>\n"
+        "💿 <b>{cat_codigo}. {local}</b>\n\n"
+        "🫧 <b>{apelido}.</b> ({qtd}x) ({tiers_obtidos}/{tiers_cadastrados})\n"
+        "🌿 <i>Giros restantes: <b>{giros_restantes}</b></i>"
+    ),
+    "giro_multi": (
+        "🌐 <b>MIX MÚLTIPLO SINTONIZADO ({qtd_giros}x)!</b>\n"
+        "🫧 <b>{apelido}</b> • 🌿 <i>Giros restantes: <b>{giros_restantes}</b></i>"
+    ),
+    "giro_rodape": (
+        "🎰 <b>Giro realizado por {apelido}!</b>\n"
+        "<i>Digite /girar para girar novamente.</i>"
+    ),
+    "sem_giros": "⏳ Seus giros acabaram por hoje! Volte amanhã.",
+}
+
+TEXTOS_META = {
+    "start_texto": {
+        "titulo": "🚀 Texto do /start",
+        "vars": "{apelido}, {giros}, {dica_apelido}, {studio}",
+    },
+    "menu_girar": {
+        "titulo": "🎰 Cabeçalho do /girar",
+        "vars": "{apelido}, {giros}",
+    },
+    "giro_resultado": {
+        "titulo": "🌐 Resultado do Giro (1x)",
+        "vars": "{apelido}, {carta_id}, {nome}, {tier_emoji}, {tier_curto}, {tier_nome}, {cat_codigo}, {local}, {qtd}, {tiers_obtidos}, {tiers_cadastrados}, {giros_restantes}",
+    },
+    "giro_multi": {
+        "titulo": "🔥 Cabeçalho Multi-Giro",
+        "vars": "{apelido}, {qtd_giros}, {giros_restantes}",
+    },
+    "giro_rodape": {
+        "titulo": "⬇️ Texto abaixo do Giro",
+        "vars": "{apelido}, {qtd_giros}, {giros_restantes}",
+    },
+    "sem_giros": {
+        "titulo": "⏳ Msg Sem Giros",
+        "vars": "{apelido}",
+    },
 }
 
 CATALOGO_INICIAL = {
@@ -102,8 +170,61 @@ CATALOGO_INICIAL = {
     CM_REN_SUB,
 ) = range(18, 25)
 
+# Estados do gerenciador de textos públicos /textos
+(
+    TX_HOME,
+    TX_VIEW,
+    TX_EDIT_VAL,
+    TX_START_MEDIA,
+    TX_TIERS_MENU,
+    TX_TIER_EDIT,
+) = range(25, 31)
+
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
+
+def texto_limpo_botao(html_str: str) -> str:
+    """Remove tags HTML (como <tg-emoji>) para exibir em botões inline."""
+    return re.sub(r"<[^>]+>", "", str(html_str))
+
+def renderizar_template(template: str, **kwargs) -> str:
+    resultado = template
+    for k, v in kwargs.items():
+        resultado = resultado.replace("{" + k + "}", str(v))
+    return resultado
+
+def extrair_html_com_custom_emojis(message) -> str:
+    """Converte o texto (ou legenda) da mensagem do admin em HTML preservando Emojis Premium (<tg-emoji>)."""
+    texto = message.text or message.caption or ""
+    entities = message.entities or message.caption_entities or []
+    if not texto:
+        return ""
+
+    utf16_bytes = texto.encode("utf-16-le")
+    custom_spans = []
+    for ent in entities:
+        if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            start_byte = ent.offset * 2
+            end_byte = (ent.offset + ent.length) * 2
+            custom_spans.append((start_byte, end_byte, ent.custom_emoji_id))
+
+    if not custom_spans:
+        return texto
+
+    custom_spans.sort(key=lambda x: x[0])
+    partes = []
+    cursor = 0
+    for start_b, end_b, emoji_id in custom_spans:
+        if start_b > cursor:
+            partes.append(utf16_bytes[cursor:start_b].decode("utf-16-le"))
+        emoji_char = utf16_bytes[start_b:end_b].decode("utf-16-le")
+        partes.append(f'<tg-emoji emoji-id="{esc(emoji_id)}">{esc(emoji_char)}</tg-emoji>')
+        cursor = end_b
+
+    if cursor < len(utf16_bytes):
+        partes.append(utf16_bytes[cursor:].decode("utf-16-le"))
+
+    return "".join(partes)
 
 # ==========================================
 # BANCO DE DADOS E INICIALIZAÇÃO
@@ -131,6 +252,10 @@ def iniciar_banco():
         CREATE TABLE IF NOT EXISTS molduras (
             tier INTEGER PRIMARY KEY CHECK (tier BETWEEN 1 AND 5),
             png_bytes BYTEA NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS config_textos (
+            chave TEXT PRIMARY KEY,
+            valor TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS usuarios (
             user_id BIGINT PRIMARY KEY,
@@ -184,6 +309,42 @@ def iniciar_banco():
     conn.commit()
     cur.close()
     conn.close()
+
+def obter_config_valor(chave: str, padrao: str = "") -> str:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT valor FROM config_textos WHERE chave = %s", (chave,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row and row[0] is not None:
+        return row[0]
+    return padrao
+
+def salvar_config_valor(chave: str, valor: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO config_textos (chave, valor) VALUES (%s, %s)
+        ON CONFLICT (chave) DO UPDATE SET valor = EXCLUDED.valor
+    """, (chave, valor))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def remover_config_valor(chave: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM config_textos WHERE chave = %s", (chave,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def obter_texto_publico(chave: str) -> str:
+    return obter_config_valor(chave, TEXTOS_PADRAO.get(chave, ""))
+
+def obter_emoji_tier(tier: int) -> str:
+    return obter_config_valor(f"tier_emoji_{tier}", TIERS_CONFIG[tier]["emoji"])
 
 def eh_admin(user_id: int) -> bool:
     if user_id in SUPER_ADMINS:
@@ -303,6 +464,20 @@ async def enviar_midia_carta(message, file_id: str, media_type: str, legenda: st
             text_kwargs["message_thread_id"] = thread_id
         await bot_ref.send_message(**text_kwargs)
 
+async def enviar_texto_seguro(chat_id: int, texto: str, bot, thread_id=None, reply_to_message=None):
+    """Envia mensagem de texto no chat/tópico mesmo se a mensagem original tiver sido apagada."""
+    if reply_to_message:
+        try:
+            await reply_to_message.reply_text(texto, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    kwargs = {"chat_id": chat_id, "text": texto, "parse_mode": "HTML"}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    await bot.send_message(**kwargs)
+
 # ==========================================
 # COMANDOS DE JOGADORES COMUNS
 # ==========================================
@@ -315,26 +490,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     giros = verificar_usuario(user.id, user.username)
     apelido, tem_apelido = obter_apelido(user.id, user.username)
 
-    texto = (
-        f"🌐 <b>Ecco-Mix Trick</b>\n"
-        f"🫧 Jogador: <b>{esc(apelido)}</b>\n"
-        f"🍃 Giros disponíveis hoje: <b>{giros}</b>\n\n"
-        f"<b>Comandos disponíveis:</b>\n"
-        f"• /girar — Escolher uma categoria e sortear uma carta\n"
-        f"• /apelido <code>nome</code> — Definir seu nome único de exibição no jogo\n"
-        f"• /colecao — Ver toda a sua coleção agrupada\n"
-        f"• /catalogo — Ver todas as cartas cadastradas por categoria\n"
-        f"• /artista <code>nome</code> — Ver seu progresso nos 5 tiers de um artista/personagem\n"
-        f"• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
-        f"• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
-        f"• /meuid — Ver seu ID numérico do Telegram"
+    dica_apelido = (
+        "\n\n💡 <i>Dica: use <code>/apelido SeuNome</code> para personalizar como seu nome aparece nas cartas.</i>"
+        if not tem_apelido else ""
     )
-    if not tem_apelido:
-        texto += "\n\n💡 <i>Dica: use <code>/apelido SeuNome</code> para personalizar como seu nome aparece nas cartas.</i>"
-    if eh_admin(user.id):
-        texto += "\n\n🛡️ <i>Modo Studio ativo: /studio</i>"
+    studio_txt = "\n\n🛡️ <i>Modo Studio ativo: /studio</i>" if eh_admin(user.id) else ""
 
-    await msg.reply_text(texto, parse_mode="HTML")
+    template_start = obter_texto_publico("start_texto")
+    texto = renderizar_template(
+        template_start,
+        apelido=esc(apelido),
+        giros=giros,
+        dica_apelido=dica_apelido,
+        studio=studio_txt,
+    )
+
+    media_id = obter_config_valor("start_media_id", "")
+    media_type = obter_config_valor("start_media_type", "animation")
+
+    if media_id:
+        if len(texto) <= 1024:
+            await enviar_midia_carta(msg, media_id, media_type, texto, bot=context.bot)
+        else:
+            await enviar_midia_carta(msg, media_id, media_type, "", bot=context.bot)
+            await msg.reply_text(texto, parse_mode="HTML")
+    else:
+        await msg.reply_text(texto, parse_mode="HTML")
 
 async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -401,6 +582,9 @@ async def cmd_meu_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg and user:
         await msg.reply_text(f"Seu ID numérico é: <code>{user.id}</code>", parse_mode="HTML")
 
+# ==========================================
+# SISTEMA DE GIROS (1x, MÚLTIPLO E GASTAR TUDO)
+# ==========================================
 async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = update.effective_user
@@ -409,10 +593,37 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     giros = verificar_usuario(user.id, user.username)
+    apelido_user, _ = obter_apelido(user.id, user.username)
 
     if giros <= 0:
-        await msg.reply_text("⏳ Seus giros acabaram por hoje! Volte amanhã.")
+        sem_giros_txt = renderizar_template(obter_texto_publico("sem_giros"), apelido=esc(apelido_user))
+        await msg.reply_text(sem_giros_txt, parse_mode="HTML")
         return
+
+    # Suporte a /girar <qtd> ou /girar tudo
+    qtd_preset = 0
+    if context.args:
+        arg0 = context.args[0].strip().lower()
+        if arg0 in ("tudo", "all", "todos", "max"):
+            qtd_preset = giros
+        elif arg0.isdigit():
+            val = int(arg0)
+            if val < 1:
+                await msg.reply_text("⚠️ Escolha pelo menos <b>1</b> giro.", parse_mode="HTML")
+                return
+            if val > giros:
+                await msg.reply_text(
+                    f"⚠️ Você só tem <b>{giros}</b> giros disponíveis no momento!",
+                    parse_mode="HTML"
+                )
+                return
+            qtd_preset = val
+        else:
+            await msg.reply_text(
+                "Uso: <code>/girar</code>, <code>/girar 5</code> ou <code>/girar tudo</code>",
+                parse_mode="HTML"
+            )
+            return
 
     conn = get_db()
     cur = conn.cursor()
@@ -424,20 +635,23 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     botoes = []
     linha = []
     for cat_id, cat_nome in categorias:
-        linha.append(InlineKeyboardButton(cat_nome, callback_data=f"rcat|{cat_id}|{user.id}"))
+        linha.append(InlineKeyboardButton(cat_nome, callback_data=f"rcat|{cat_id}|{qtd_preset}|{user.id}"))
         if len(linha) == 2:
             botoes.append(linha)
             linha = []
     if linha:
         botoes.append(linha)
 
-    botoes.append([InlineKeyboardButton("🌐 Mix Aleatório (Tudo)", callback_data=f"rcat|all|{user.id}")])
+    botoes.append([InlineKeyboardButton("🌐 Mix Aleatório (Tudo)", callback_data=f"rcat|all|{qtd_preset}|{user.id}")])
 
-    apelido_user, _ = obter_apelido(user.id, user.username)
-    texto_menu = (
-        f"🫧 <b>{esc(apelido_user)}</b> • 🍃 Giros restantes: <b>{giros}</b>\n"
-        f"Escolha a categoria:"
+    texto_menu = renderizar_template(
+        obter_texto_publico("menu_girar"),
+        apelido=esc(apelido_user),
+        giros=giros,
     )
+    if qtd_preset > 0:
+        texto_menu += f"\n🎯 <i>Quantidade selecionada: <b>{qtd_preset}x</b></i>"
+
     markup = InlineKeyboardMarkup(botoes)
 
     try:
@@ -455,16 +669,52 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ Não consegui exibir os botões neste grupo. Verifique se o bot tem permissão para enviar mensagens e usar teclados inline."
             )
 
+def _montar_teclado_qtd_giros(cat_alvo: str, sub_alvo: str, giros: int, dono_id: int) -> InlineKeyboardMarkup:
+    botoes = [
+        [
+            InlineKeyboardButton("🎲 1x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|1|{dono_id}"),
+            InlineKeyboardButton(f"🔥 Todos ({giros}x)", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|all|{dono_id}"),
+        ]
+    ]
+    extras = []
+    if giros > 3:
+        extras.append(InlineKeyboardButton("🎲 3x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|3|{dono_id}"))
+    if giros > 5:
+        extras.append(InlineKeyboardButton("🎲 5x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|5|{dono_id}"))
+    if giros > 2:
+        extras.append(InlineKeyboardButton("✏️ Escolher qtd", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|custom|{dono_id}"))
+    if extras:
+        botoes.append(extras)
+    return InlineKeyboardMarkup(botoes)
+
 async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    _, cat_alvo, dono_id = query.data.split("|")
+    _, cat_alvo, qtd_str, dono_id_str = query.data.split("|")
+    dono_id = int(dono_id_str)
+    qtd_preset = int(qtd_str)
 
-    if query.from_user.id != int(dono_id):
+    if query.from_user.id != dono_id:
         await query.answer("Esse menu de giro não é seu!", show_alert=True)
         return
 
+    giros = verificar_usuario(query.from_user.id, query.from_user.username)
+    if giros <= 0:
+        await query.answer("Seus giros acabaram!", show_alert=True)
+        return
+
     if cat_alvo == "all":
-        await executar_sorteio(query, context, cat_id=None, sub_id=None)
+        if qtd_preset > 0:
+            await executar_sorteio(query, context, cat_id=None, sub_id=None, qtd_giros=min(qtd_preset, giros))
+            return
+        if giros == 1:
+            await executar_sorteio(query, context, cat_id=None, sub_id=None, qtd_giros=1)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"🌐 <b>Mix Aleatório (Tudo)</b>\n🍃 Você tem <b>{giros}</b> giros. Quantos deseja gastar?",
+            reply_markup=_montar_teclado_qtd_giros("all", "all", giros, dono_id),
+            parse_mode="HTML"
+        )
         return
 
     cat_id = int(cat_alvo)
@@ -482,20 +732,31 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
         return
 
     if not subs:
-        await executar_sorteio(query, context, cat_id=cat_id, sub_id=None)
+        if qtd_preset > 0:
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, qtd_giros=min(qtd_preset, giros))
+            return
+        if giros == 1:
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, qtd_giros=1)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"💿 <b>{esc(cat_row[0])}</b>\n🍃 Você tem <b>{giros}</b> giros. Quantos deseja gastar?",
+            reply_markup=_montar_teclado_qtd_giros(str(cat_id), "all", giros, dono_id),
+            parse_mode="HTML"
+        )
         return
 
     botoes = []
     linha = []
     for sub_id, sub_nome in subs:
-        linha.append(InlineKeyboardButton(sub_nome, callback_data=f"rsub|{cat_id}|{sub_id}|{dono_id}"))
+        linha.append(InlineKeyboardButton(sub_nome, callback_data=f"rsub|{cat_id}|{sub_id}|{qtd_preset}|{dono_id}"))
         if len(linha) == 2:
             botoes.append(linha)
             linha = []
     if linha:
         botoes.append(linha)
 
-    botoes.append([InlineKeyboardButton(f"🌐 Todos de {cat_row[0]}", callback_data=f"rsub|{cat_id}|all|{dono_id}")])
+    botoes.append([InlineKeyboardButton(f"🌐 Todos de {cat_row[0]}", callback_data=f"rsub|{cat_id}|all|{qtd_preset}|{dono_id}")])
 
     await query.answer()
     await query.edit_message_text(
@@ -506,33 +767,170 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
 
 async def callback_girar_subcategoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    _, cat_id_str, sub_alvo, dono_id = query.data.split("|")
+    _, cat_id_str, sub_alvo, qtd_str, dono_id_str = query.data.split("|")
+    dono_id = int(dono_id_str)
+    qtd_preset = int(qtd_str)
 
-    if query.from_user.id != int(dono_id):
+    if query.from_user.id != dono_id:
         await query.answer("Esse menu de giro não é seu!", show_alert=True)
+        return
+
+    giros = verificar_usuario(query.from_user.id, query.from_user.username)
+    if giros <= 0:
+        await query.answer("Seus giros acabaram!", show_alert=True)
         return
 
     cat_id = int(cat_id_str)
     sub_id = None if sub_alvo == "all" else int(sub_alvo)
-    await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id)
 
-async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None):
-    user = query.from_user
+    if qtd_preset > 0:
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=min(qtd_preset, giros))
+        return
 
+    if giros == 1:
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=1)
+        return
+
+    await query.answer()
+    await query.edit_message_text(
+        f"🍃 Você tem <b>{giros}</b> giros disponíveis. Quantos deseja gastar agora?",
+        reply_markup=_montar_teclado_qtd_giros(cat_id_str, sub_alvo, giros, dono_id),
+        parse_mode="HTML"
+    )
+
+async def callback_girar_quantidade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, cat_alvo, sub_alvo, qtd_modo, dono_id_str = query.data.split("|")
+    dono_id = int(dono_id_str)
+
+    if query.from_user.id != dono_id:
+        await query.answer("Esse menu de giro não é seu!", show_alert=True)
+        return
+
+    giros = verificar_usuario(query.from_user.id, query.from_user.username)
+    if giros <= 0:
+        await query.answer("Seus giros acabaram!", show_alert=True)
+        return
+
+    cat_id = None if cat_alvo == "all" else int(cat_alvo)
+    sub_id = None if sub_alvo == "all" else int(sub_alvo)
+
+    if qtd_modo == "custom":
+        await query.answer()
+        chat_id = query.message.chat_id
+        pending = context.bot_data.setdefault("custom_spin", {})
+        pending[(chat_id, dono_id)] = {
+            "cat_id": cat_id,
+            "sub_id": sub_id,
+            "menu_msg": query.message,
+        }
+        await query.edit_message_text(
+            f"✏️ Digite no chat <b>quantos giros</b> deseja gastar (de <b>1</b> a <b>{giros}</b>):",
+            parse_mode="HTML"
+        )
+        return
+
+    qtd_giros = giros if qtd_modo == "all" else min(int(qtd_modo), giros)
+    await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=qtd_giros)
+
+async def handler_custom_spin_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recebe o número digitado quando o jogador escolhe 'Escolher qtd' no /girar."""
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat or not msg.text:
+        return
+
+    pending = context.bot_data.get("custom_spin", {})
+    chave = (chat.id, user.id)
+    if chave not in pending:
+        return
+
+    txt = msg.text.strip().lower()
+    giros = verificar_usuario(user.id, user.username)
+
+    if txt in ("cancelar", "sair"):
+        pending.pop(chave, None)
+        await msg.reply_text("❌ Seleção de giros cancelada.")
+        return
+
+    if txt in ("tudo", "all", "todos", "max"):
+        qtd = giros
+    elif txt.isdigit():
+        qtd = int(txt)
+    else:
+        await msg.reply_text(f"⚠️ Digite apenas um número de <b>1</b> a <b>{giros}</b> (ou <code>cancelar</code>).", parse_mode="HTML")
+        return
+
+    if qtd < 1 or qtd > giros:
+        await msg.reply_text(
+            f"⚠️ Quantidade inválida! Seu limite atual é de <b>{giros}</b> giros. Digite um número entre <b>1</b> e <b>{giros}</b>:",
+            parse_mode="HTML"
+        )
+        return
+
+    dados = pending.pop(chave)
+    await _processar_giros_core(
+        user=user,
+        chat_id=chat.id,
+        thread_id=getattr(msg, "message_thread_id", None),
+        reply_anchor=msg,
+        menu_message=dados.get("menu_msg"),
+        bot=context.bot,
+        cat_id=dados["cat_id"],
+        sub_id=dados["sub_id"],
+        qtd_giros=qtd,
+        query=None,
+    )
+
+async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None, qtd_giros: int = 1):
+    await _processar_giros_core(
+        user=query.from_user,
+        chat_id=query.message.chat_id,
+        thread_id=getattr(query.message, "message_thread_id", None),
+        reply_anchor=query.message,
+        menu_message=query.message,
+        bot=context.bot,
+        cat_id=cat_id,
+        sub_id=sub_id,
+        qtd_giros=qtd_giros,
+        query=query,
+    )
+
+async def _processar_giros_core(
+    user,
+    chat_id: int,
+    thread_id,
+    reply_anchor,
+    menu_message,
+    bot,
+    cat_id=None,
+    sub_id=None,
+    qtd_giros: int = 1,
+    query=None,
+):
     if user.id in GIROS_EM_ANDAMENTO:
-        await query.answer("Aguarde o giro atual terminar!", show_alert=True)
+        if query:
+            await query.answer("Aguarde o giro atual terminar!", show_alert=True)
         return
 
     GIROS_EM_ANDAMENTO.add(user.id)
     try:
         giros = verificar_usuario(user.id, user.username)
+        apelido_user, _ = obter_apelido(user.id, user.username)
+
         if giros <= 0:
-            await query.answer("Seus giros acabaram!", show_alert=True)
-            try:
-                await query.edit_message_text("⏳ Seus giros acabaram por hoje! Volte amanhã.")
-            except Exception:
-                pass
+            sem_giros_txt = renderizar_template(obter_texto_publico("sem_giros"), apelido=esc(apelido_user))
+            if query:
+                await query.answer("Seus giros acabaram!", show_alert=True)
+            if menu_message:
+                try:
+                    await menu_message.edit_text(sem_giros_txt, parse_mode="HTML")
+                except Exception:
+                    pass
             return
+
+        qtd_efetiva = max(1, min(qtd_giros, giros))
 
         conn = get_db()
         cur = conn.cursor()
@@ -552,81 +950,333 @@ async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=Non
 
         cartas = cur.fetchall()
         if not cartas:
-            await query.answer("Ainda não há cartas cadastradas aqui.", show_alert=True)
+            if query:
+                await query.answer("Ainda não há cartas cadastradas aqui.", show_alert=True)
+            else:
+                await reply_anchor.reply_text("Ainda não há cartas cadastradas nessa categoria.")
             cur.close()
             conn.close()
             return
 
-        # Remove os botões do menu imediatamente para impedir cliques repetidos
-        await query.answer()
-        try:
-            await query.edit_message_text("🎲 <i>Sintonizando mix...</i>", parse_mode="HTML")
-        except Exception:
-            pass
+        if query:
+            await query.answer()
+
+        if menu_message:
+            try:
+                await menu_message.edit_text(
+                    f"🎲 <i>Sintonizando {'mix' if qtd_efetiva == 1 else f'{qtd_efetiva} mixes'}...</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
         pesos = [c[7] for c in cartas]
-        (
-            carta_id,
-            nome_carta,
-            cid_cat,
-            nome_cat,
-            cid_sub,
-            nome_sub,
-            tier,
-            _,
-            file_id,
-            media_type,
-        ) = random.choices(cartas, weights=pesos, k=1)[0]
+        sorteadas = random.choices(cartas, weights=pesos, k=qtd_efetiva)
 
-        cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - 1 WHERE user_id = %s", (user.id,))
-        cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
-        item = cur.fetchone()
+        cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - %s WHERE user_id = %s", (qtd_efetiva, user.id))
 
-        if item:
-            qtd_carta = item[1] + 1
-            cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (qtd_carta, item[0]))
+        resultados_lote = []
+        for c_tuple in sorteadas:
+            (
+                carta_id,
+                nome_carta,
+                cid_cat,
+                nome_cat,
+                cid_sub,
+                nome_sub,
+                tier,
+                _,
+                file_id,
+                media_type,
+            ) = c_tuple
+
+            cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
+            item = cur.fetchone()
+            if item:
+                qtd_carta = item[1] + 1
+                eh_nova = False
+                cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (qtd_carta, item[0]))
+            else:
+                qtd_carta = 1
+                eh_nova = True
+                cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
+
+            resultados_lote.append({
+                "carta_id": carta_id,
+                "nome": nome_carta,
+                "cid_cat": cid_cat,
+                "nome_cat": nome_cat,
+                "cid_sub": cid_sub,
+                "nome_sub": nome_sub,
+                "tier": tier,
+                "file_id": file_id,
+                "media_type": media_type,
+                "qtd_total": qtd_carta,
+                "eh_nova": eh_nova,
+            })
+
+        giros_restantes = giros - qtd_efetiva
+
+        if qtd_efetiva == 1:
+            r = resultados_lote[0]
+            cur.execute("""
+                SELECT COUNT(DISTINCT c.tier)
+                FROM inventario i
+                JOIN cartas c ON i.carta_id = c.id
+                WHERE i.user_id = %s AND LOWER(c.nome) = LOWER(%s)
+            """, (user.id, r["nome"]))
+            tiers_obtidos = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (r["nome"],))
+            tiers_cadastrados = cur.fetchone()[0]
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            tier_info = TIERS_CONFIG[r["tier"]]
+            tier_emoji = obter_emoji_tier(r["tier"])
+            cat_codigo = r["cid_sub"] if r["cid_sub"] else r["cid_cat"]
+            local_str = f"{esc(r['nome_cat'])} • {esc(r['nome_sub'])}" if r["nome_sub"] else esc(r["nome_cat"])
+
+            legenda = renderizar_template(
+                obter_texto_publico("giro_resultado"),
+                apelido=esc(apelido_user),
+                carta_id=r["carta_id"],
+                nome=esc(r["nome"]),
+                tier_emoji=tier_emoji,
+                tier_curto=tier_info["curto"],
+                tier_nome=tier_info["nome"],
+                cat_codigo=cat_codigo,
+                local=local_str,
+                qtd=r["qtd_total"],
+                tiers_obtidos=tiers_obtidos,
+                tiers_cadastrados=tiers_cadastrados,
+                giros_restantes=giros_restantes,
+            )
+            await enviar_midia_carta(reply_anchor, r["file_id"], r["media_type"], legenda, bot=bot)
         else:
-            qtd_carta = 1
-            cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
+            conn.commit()
+            cur.close()
+            conn.close()
 
-        cur.execute("""
-            SELECT COUNT(DISTINCT c.tier)
-            FROM inventario i
-            JOIN cartas c ON i.carta_id = c.id
-            WHERE i.user_id = %s AND LOWER(c.nome) = LOWER(%s)
-        """, (user.id, nome_carta))
-        tiers_obtidos = cur.fetchone()[0]
+            # Destaque = carta de maior Tier sorteada no lote
+            destaque = max(resultados_lote, key=lambda x: x["tier"])
+            destaque_emoji = obter_emoji_tier(destaque["tier"])
+            destaque_info = TIERS_CONFIG[destaque["tier"]]
 
-        cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_carta,))
-        tiers_cadastrados = cur.fetchone()[0]
+            cabecalho = renderizar_template(
+                obter_texto_publico("giro_multi"),
+                apelido=esc(apelido_user),
+                qtd_giros=qtd_efetiva,
+                giros_restantes=giros_restantes,
+            )
 
-        conn.commit()
+            linhas = [
+                cabecalho,
+                f"\n🌟 <b>Destaque:</b> {destaque_emoji} <b>#{destaque['carta_id']} {esc(destaque['nome'])}</b> <i>[{destaque_info['curto']}]</i>\n",
+            ]
+
+            if qtd_efetiva <= 20:
+                for item in resultados_lote:
+                    em = obter_emoji_tier(item["tier"])
+                    t_c = TIERS_CONFIG[item["tier"]]["curto"]
+                    tag_nova = " 🆕" if item["eh_nova"] else f" (x{item['qtd_total']})"
+                    linhas.append(f"{em} <code>#{item['carta_id']}</code> <b>{esc(item['nome'])}</b> <i>[{t_c}]</i>{tag_nova}")
+            else:
+                agrupado = {}
+                for item in resultados_lote:
+                    key = item["carta_id"]
+                    if key not in agrupado:
+                        agrupado[key] = {**item, "vezes": 0, "teve_nova": False}
+                    agrupado[key]["vezes"] += 1
+                    if item["eh_nova"]:
+                        agrupado[key]["teve_nova"] = True
+                for item in agrupado.values():
+                    em = obter_emoji_tier(item["tier"])
+                    t_c = TIERS_CONFIG[item["tier"]]["curto"]
+                    tag_nova = " 🆕" if item["teve_nova"] else ""
+                    vezes_txt = f" <b>({item['vezes']}x)</b>" if item["vezes"] > 1 else ""
+                    linhas.append(f"{em} <code>#{item['carta_id']}</code> <b>{esc(item['nome'])}</b> <i>[{t_c}]</i>{vezes_txt}{tag_nova}")
+
+            legenda = "\n".join(linhas)
+            if len(legenda) <= 1024:
+                await enviar_midia_carta(reply_anchor, destaque["file_id"], destaque["media_type"], legenda, bot=bot)
+            else:
+                await enviar_midia_carta(
+                    reply_anchor,
+                    destaque["file_id"],
+                    destaque["media_type"],
+                    f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{destaque['carta_id']} {esc(destaque['nome'])}</b> <i>[{destaque_info['curto']}]</i>",
+                    bot=bot,
+                )
+                await enviar_texto_seguro(chat_id, legenda[:4000], bot, thread_id=thread_id, reply_to_message=reply_anchor)
+
+        # Apaga o menu de botões de cima e envia o rodapé EMBAIXO do resultado do giro
+        if menu_message:
+            try:
+                await menu_message.delete()
+            except Exception:
+                pass
+
+        rodape_txt = renderizar_template(
+            obter_texto_publico("giro_rodape"),
+            apelido=esc(apelido_user),
+            qtd_giros=qtd_efetiva,
+            giros_restantes=giros_restantes,
+        )
+        await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id, reply_to_message=reply_anchor)
+    finally:
+        GIROS_EM_ANDAMENTO.discard(user.id)
+
+# ==========================================
+# RANKING DE USUÁRIOS POR ARTISTA / PERSONAGEM
+# ==========================================
+def _montar_texto_ranking_artista(nome_oficial: str, caller_id: int) -> str:
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT cat.nome, sub.nome, COUNT(*)
+        FROM cartas c
+        JOIN categorias cat ON c.categoria_id = cat.id
+        LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        WHERE LOWER(c.nome) = LOWER(%s)
+        GROUP BY cat.nome, sub.nome
+        LIMIT 1
+    """, (nome_oficial,))
+    meta = cur.fetchone()
+    cat_nome, sub_nome, total_tiers_artista = meta if meta else ("", None, 5)
+
+    cur.execute("""
+        SELECT
+            u.user_id,
+            u.username,
+            u.apelido,
+            COUNT(DISTINCT c.tier) AS tiers_unicos,
+            MAX(c.tier) AS maior_tier,
+            SUM(i.quantidade) AS total_cartas
+        FROM inventario i
+        JOIN cartas c ON i.carta_id = c.id
+        JOIN usuarios u ON i.user_id = u.user_id
+        WHERE LOWER(c.nome) = LOWER(%s) AND i.quantidade > 0
+        GROUP BY u.user_id, u.username, u.apelido
+        ORDER BY tiers_unicos DESC, maior_tier DESC, total_cartas DESC, u.user_id ASC
+    """, (nome_oficial,))
+    ranking = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    local_str = f"{esc(cat_nome)} • {esc(sub_nome)}" if sub_nome else esc(cat_nome)
+    linhas = [
+        f"🏆 <b>Ranking — {esc(nome_oficial)}</b> <i>({local_str})</i>\n"
+    ]
+
+    if not ranking:
+        linhas.append("<i>Nenhum jogador desbloqueou cartas desse artista/personagem ainda.</i>")
+        return "\n".join(linhas)
+
+    medalhas = {1: "🥇", 2: "🥈", 3: "🥉"}
+    pos_caller = None
+
+    for idx, (uid, uname, apelido_db, tiers_unicos, maior_tier, total_cartas) in enumerate(ranking, start=1):
+        if uid == caller_id:
+            pos_caller = (idx, tiers_unicos, total_cartas)
+        if idx > 15:
+            continue
+
+        if apelido_db and apelido_db.strip():
+            nome_exib = apelido_db.strip()
+        elif uname:
+            nome_exib = f"@{uname}"
+        else:
+            nome_exib = f"Mixer #{str(uid)[-4:]}"
+
+        prefixo = medalhas.get(idx, f"<b>{idx}.</b>")
+        coroa = " 💠" if (tiers_unicos == total_tiers_artista and total_tiers_artista >= 5) else ""
+        linhas.append(
+            f"{prefixo} <b>{esc(nome_exib)}</b> — <b>{tiers_unicos}/{total_tiers_artista}</b> tiers "
+            f"<i>({total_cartas} {'carta' if total_cartas == 1 else 'cartas'})</i>{coroa}"
+        )
+
+    if pos_caller and pos_caller[0] > 15:
+        linhas.append(
+            f"\n📍 <b>Sua posição:</b> #{pos_caller[0]} — {pos_caller[1]}/{total_tiers_artista} tiers ({pos_caller[2]} cartas)"
+        )
+
+    return "\n".join(linhas)
+
+async def cmd_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    verificar_usuario(user.id, user.username)
+    busca = " ".join(context.args).strip()
+
+    if not busca:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT MIN(id), MIN(nome) FROM cartas GROUP BY LOWER(nome) ORDER BY RANDOM() LIMIT 6")
+        sugestoes = cur.fetchall()
         cur.close()
         conn.close()
 
-        apelido_user, _ = obter_apelido(user.id, user.username)
-        tier_info = TIERS_CONFIG[tier]
-        cat_codigo = cid_sub if cid_sub else cid_cat
-        local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
+        botoes = []
+        linha = []
+        for cid, anome in sugestoes:
+            linha.append(InlineKeyboardButton(f"🏆 {anome}", callback_data=f"rank_cid|{cid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
 
-        legenda = (
-            f"🌐 <b>MIX SINTONIZADO! Você desbloqueou:</b>\n\n"
-            f"{tier_info['emoji']} <b>{carta_id}. {esc(nome_carta)}.</b> <i>[{tier_info['curto']}]</i>\n"
-            f"💿 <b>{cat_codigo}. {local_str}</b>\n\n"
-            f"🫧 <b>{esc(apelido_user)}.</b> ({qtd_carta}x) ({tiers_obtidos}/{tiers_cadastrados})\n"
-            f"🌿 <i>Giros restantes: <b>{giros - 1}</b></i>"
+        await msg.reply_text(
+            "🏆 <b>Ranking por Artista / Personagem</b>\n\n"
+            "Uso: <code>/ranking nome</code> (ex: <code>/ranking kuru</code>)\n"
+            "Ou toque em uma sugestão abaixo:",
+            reply_markup=InlineKeyboardMarkup(botoes) if botoes else None,
+            parse_mode="HTML"
         )
-        await enviar_midia_carta(query.message, file_id, media_type, legenda, bot=context.bot)
+        return
 
-        try:
-            await query.edit_message_text(
-                f"🎰 <b>Giro realizado por {esc(apelido_user)}!</b>\n<i>Digite /girar para girar novamente.</i>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    finally:
-        GIROS_EM_ANDAMENTO.discard(user.id)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM cartas WHERE LOWER(nome) = LOWER(%s) LIMIT 1", (busca,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("SELECT nome FROM cartas WHERE LOWER(nome) LIKE LOWER(%s) ORDER BY nome ASC LIMIT 1", (f"%{busca}%",))
+        row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        await msg.reply_text("Nenhum artista/personagem encontrado com esse nome.")
+        return
+
+    texto = _montar_texto_ranking_artista(row[0], user.id)
+    await msg.reply_text(texto, parse_mode="HTML")
+
+async def callback_ranking_cid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    cid = int(query.data.split("|")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM cartas WHERE id = %s", (cid,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        await query.answer("Artista não encontrado.", show_alert=True)
+        return
+
+    await query.answer()
+    texto = _montar_texto_ranking_artista(row[0], query.from_user.id)
+    await query.message.reply_text(texto, parse_mode="HTML")
 
 # ==========================================
 # CATÁLOGO EM TEXTO COM BOTÕES E PAGINAÇÃO (/catalogo)
@@ -801,12 +1451,13 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: 
     ]
     for cid, nome, tier, c_nome, s_nome in rows:
         t_cfg = TIERS_CONFIG[tier]
+        t_em = obter_emoji_tier(tier)
         marca = " ✅" if cid in possuidas else ""
         extra_local = ""
         if cat_alvo == "all":
             loc = f"{c_nome} • {s_nome}" if s_nome else c_nome
             extra_local = f" <i>({esc(loc)})</i>"
-        linhas.append(f"{t_cfg['emoji']} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{t_cfg['curto']}</i>{extra_local}{marca}")
+        linhas.append(f"{t_em} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{t_cfg['curto']}</i>{extra_local}{marca}")
 
     botoes = []
     nav = []
@@ -874,6 +1525,7 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cartas = [r for r in resultados if r[1].lower() == nome_alvo]
 
     nome_oficial = cartas[0][1]
+    primeiro_cid = cartas[0][0]
     cat_nome = cartas[0][2]
     sub_nome = cartas[0][3]
     mapa_tiers = {c[4]: c[0] for c in cartas}
@@ -899,16 +1551,18 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for t in range(1, 6):
         t_cfg = TIERS_CONFIG[t]
+        t_em = obter_emoji_tier(t)
         if t in mapa_tiers:
             cid = mapa_tiers[t]
             if t in posse:
-                linhas.append(f"{t_cfg['emoji']} <b>{t_cfg['nome']}:</b> ✅ (<code>#{cid}</code> — {posse[t]}x)")
+                linhas.append(f"{t_em} <b>{t_cfg['nome']}:</b> ✅ (<code>#{cid}</code> — {posse[t]}x)")
             else:
-                linhas.append(f"{t_cfg['emoji']} <b>{t_cfg['nome']}:</b> ❌ (<code>#{cid}</code>)")
+                linhas.append(f"{t_em} <b>{t_cfg['nome']}:</b> ❌ (<code>#{cid}</code>)")
         else:
-            linhas.append(f"{t_cfg['emoji']} <b>{t_cfg['nome']}:</b> ➖ <i>(Não cadastrada)</i>")
+            linhas.append(f"{t_em} <b>{t_cfg['nome']}:</b> ➖ <i>(Não cadastrada)</i>")
 
-    await msg.reply_text("\n".join(linhas), parse_mode="HTML")
+    botoes = [[InlineKeyboardButton("🏆 Ver Ranking deste Artista", callback_data=f"rank_cid|{primeiro_cid}")]]
+    await msg.reply_text("\n".join(linhas), reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
 async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -948,11 +1602,11 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas = [f"🫧 <b>Coleção de {esc(apelido_user)}</b>\n"]
     for nome, lista in agrupado.items():
         total_existentes = totais.get(nome.lower(), len(lista))
-        selo = "💠 " if len(lista) == 5 else ""
+        selo = f"{obter_emoji_tier(5)} " if len(lista) == 5 else ""
         resumo_tiers = ", ".join([f"T{t} (<code>#{cid}</code> x{qtd})" for cid, t, qtd in lista])
         linhas.append(f"{selo}<b>{esc(nome)}</b> [{len(lista)}/{total_existentes}]: {resumo_tiers}")
 
-    linhas.append("\n<i>Use /artista nome para ver detalhes por tier.</i>")
+    linhas.append("\n<i>Use /artista nome para ver detalhes ou /ranking nome para ver o top jogadores.</i>")
     await msg.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
 
 async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -985,10 +1639,11 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cid, nome, cid_cat, nome_cat, cid_sub, nome_sub, tier, file_id, media_type = carta
     t_cfg = TIERS_CONFIG[tier]
+    t_em = obter_emoji_tier(tier)
     cat_codigo = cid_sub if cid_sub else cid_cat
     local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
     legenda = (
-        f"{t_cfg['emoji']} <b>{cid}. {esc(nome)}.</b>\n"
+        f"{t_em} <b>{cid}. {esc(nome)}.</b>\n"
         f"💿 <b>{cat_codigo}. {local_str}</b>\n"
         f"🔮 <b>Raridade:</b> {t_cfg['nome']}"
     )
@@ -1544,10 +2199,11 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     botoes = []
     for t in range(1, 6):
         t_cfg = TIERS_CONFIG[t]
+        em_btn = texto_limpo_botao(obter_emoji_tier(t))
         if t in ocupados:
             botoes.append([InlineKeyboardButton(f"⛔ {t_cfg['nome']} (Já existe)", callback_data=f"wiz_tier_lock|{t}")])
         else:
-            botoes.append([InlineKeyboardButton(f"{t_cfg['emoji']} {t_cfg['nome']}", callback_data=f"wiz_tier|{t}")])
+            botoes.append([InlineKeyboardButton(f"{em_btn} {t_cfg['nome']}", callback_data=f"wiz_tier|{t}")])
     botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")])
 
     await msg.reply_text(
@@ -1607,11 +2263,12 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     t_cfg = TIERS_CONFIG[tier]
+    t_em = obter_emoji_tier(tier)
     cat_codigo = sub_id if sub_id else cat_id
     local_str = f"{esc(cat_nome)} • {esc(sub_nome)}" if sub_nome else esc(cat_nome)
     await query.message.reply_text(
         f"✅ <b>Carta cadastrada com sucesso!</b>\n\n"
-        f"{t_cfg['emoji']} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n"
+        f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n"
         f"💿 <b>{cat_codigo}. {local_str}</b>",
         parse_mode="HTML"
     )
@@ -1679,7 +2336,7 @@ def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMark
     botoes = []
     linha = []
     for cid, cnome, ctier in cartas_pag:
-        emoji = TIERS_CONFIG[ctier]["emoji"]
+        emoji = texto_limpo_botao(obter_emoji_tier(ctier))
         linha.append(InlineKeyboardButton(f"#{cid} {cnome} {emoji}", callback_data=f"ed_pick|{cid}"))
         if len(linha) == 2:
             botoes.append(linha)
@@ -1706,13 +2363,14 @@ def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMark
 
 def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
     t_cfg = TIERS_CONFIG[d["tier"]]
+    t_em = obter_emoji_tier(d["tier"])
     cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
     local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
     midia_label = "GIF" if d["media_type"] == "animation" else f"Foto ({LARGURA_CARTA}×{ALTURA_CARTA})"
 
     texto = (
         f"🛠️ <b>Editando Carta #{d['id']}</b>\n\n"
-        f"{t_cfg['emoji']} <b>Nome:</b> {esc(d['nome'])}\n"
+        f"{t_em} <b>Nome:</b> {esc(d['nome'])}\n"
         f"💿 <b>Categoria:</b> {cat_codigo}. {local_str}\n"
         f"💎 <b>Tier:</b> {t_cfg['nome']}\n"
         f"🖼️ <b>Mídia:</b> {midia_label}\n\n"
@@ -1851,11 +2509,12 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.answer("Salvo!")
         t_cfg = TIERS_CONFIG[d["tier"]]
+        t_em = obter_emoji_tier(d["tier"])
         cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
         local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
         await query.edit_message_text(
             f"✅ <b>Carta #{d['id']} atualizada!</b>\n\n"
-            f"{t_cfg['emoji']} <b>{d['id']}. {esc(d['nome'])}.</b> <i>[{t_cfg['curto']}]</i>\n"
+            f"{t_em} <b>{d['id']}. {esc(d['nome'])}.</b> <i>[{t_cfg['curto']}]</i>\n"
             f"💿 <b>{cat_codigo}. {local_str}</b>",
             parse_mode="HTML"
         )
@@ -1917,11 +2576,12 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         botoes = []
         for t in range(1, 6):
             t_cfg = TIERS_CONFIG[t]
+            em_btn = texto_limpo_botao(obter_emoji_tier(t))
             if t in ocupados:
                 botoes.append([InlineKeyboardButton(f"⛔ {t_cfg['nome']} (Já existe)", callback_data=f"ed_tlock|{t}")])
             else:
                 marca = " (Atual)" if t == d["tier"] else ""
-                botoes.append([InlineKeyboardButton(f"{t_cfg['emoji']} {t_cfg['nome']}{marca}", callback_data=f"ed_tier|{t}")])
+                botoes.append([InlineKeyboardButton(f"{em_btn} {t_cfg['nome']}{marca}", callback_data=f"ed_tier|{t}")])
         botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="ed_voltar")])
 
         await query.edit_message_text(
@@ -2573,6 +3233,255 @@ async def catmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
+# GERENCIADOR DE TEXTOS PÚBLICOS, GIF DO /start E EMOJIS PREMIUM (/textos)
+# ==========================================
+def _montar_home_textos() -> tuple[str, InlineKeyboardMarkup]:
+    tem_midia_start = bool(obter_config_valor("start_media_id", ""))
+    status_midia = "✅ GIF/Foto ativo" if tem_midia_start else "➖ Sem mídia"
+
+    texto = (
+        "📝 <b>Editor de Textos Públicos & Emojis Premium</b>\n\n"
+        "Aqui você edita as mensagens exibidas aos jogadores, o GIF do <code>/start</code> e os emojis dos Tiers.\n"
+        f"🎞️ <b>Mídia do /start:</b> {status_midia}\n\n"
+        "💡 <i>Dica: ao enviar qualquer texto ou emoji de Tier, basta usar os <b>Emojis Premium do Telegram</b> normalmente no teclado que o bot salva o ID animado automaticamente!</i>"
+    )
+
+    botoes = [
+        [
+            InlineKeyboardButton("🚀 Texto do /start", callback_data="txmgr|item|start_texto"),
+            InlineKeyboardButton("🎞️ GIF / Foto do /start", callback_data="txmgr|start_media"),
+        ],
+        [
+            InlineKeyboardButton("🎰 Menu /girar", callback_data="txmgr|item|menu_girar"),
+            InlineKeyboardButton("🌐 Resultado Giro (1x)", callback_data="txmgr|item|giro_resultado"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Cabeçalho Multi-Giro", callback_data="txmgr|item|giro_multi"),
+            InlineKeyboardButton("⬇️ Rodapé pós-Giro", callback_data="txmgr|item|giro_rodape"),
+        ],
+        [
+            InlineKeyboardButton("⏳ Msg Sem Giros", callback_data="txmgr|item|sem_giros"),
+            InlineKeyboardButton("🎨 Emojis dos Tiers", callback_data="txmgr|tiers"),
+        ],
+        [
+            InlineKeyboardButton("❌ Fechar", callback_data="txmgr|close"),
+        ],
+    ]
+    return texto, InlineKeyboardMarkup(botoes)
+
+def _montar_view_texto(chave: str) -> tuple[str, InlineKeyboardMarkup]:
+    meta = TEXTOS_META[chave]
+    atual = obter_texto_publico(chave)
+    texto = (
+        f"📝 <b>{meta['titulo']}</b>\n\n"
+        f"<b>Texto atual:</b>\n"
+        f"────────────────────\n"
+        f"{atual}\n"
+        f"────────────────────\n\n"
+        f"<b>Variáveis disponíveis:</b>\n<code>{esc(meta['vars'])}</code>"
+    )
+    botoes = [
+        [
+            InlineKeyboardButton("✏️ Editar Texto", callback_data="txmgr|edit"),
+            InlineKeyboardButton("🔄 Restaurar Padrão", callback_data="txmgr|reset"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar", callback_data="txmgr|home"),
+        ],
+    ]
+    return texto, InlineKeyboardMarkup(botoes)
+
+def _montar_view_start_media() -> tuple[str, InlineKeyboardMarkup]:
+    media_id = obter_config_valor("start_media_id", "")
+    media_type = obter_config_valor("start_media_type", "animation")
+    status = f"✅ <b>Ativa</b> ({'GIF' if media_type == 'animation' else 'Foto'})" if media_id else "➖ <b>Nenhuma mídia configurada</b>"
+    texto = (
+        f"🎞️ <b>GIF / Foto do /start</b>\n\n"
+        f"Status atual: {status}\n\n"
+        f"Envie um <b>GIF</b> ou <b>Foto</b> agora para definir como mídia de boas-vindas do <code>/start</code>:"
+    )
+    botoes = []
+    if media_id:
+        botoes.append([InlineKeyboardButton("🗑️ Remover Mídia do /start", callback_data="txmgr|del_start_media")])
+    botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="txmgr|home")])
+    return texto, InlineKeyboardMarkup(botoes)
+
+def _montar_view_tiers_emojis() -> tuple[str, InlineKeyboardMarkup]:
+    linhas = ["🎨 <b>Emojis dos Tiers (Normal ou Premium)</b>\n"]
+    botoes = []
+    for t in range(1, 6):
+        em = obter_emoji_tier(t)
+        linhas.append(f"• <b>{TIERS_CONFIG[t]['nome']}:</b> {em}")
+        botoes.append([InlineKeyboardButton(f"✏️ Alterar {TIERS_CONFIG[t]['curto']}", callback_data=f"txmgr|tier|{t}")])
+    botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="txmgr|home")])
+    return "\n".join(linhas), InlineKeyboardMarkup(botoes)
+
+async def txmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["admin_id"] = update.effective_user.id
+
+    texto, markup = _montar_home_textos()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return TX_HOME
+
+async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return TX_HOME
+
+    partes = query.data.split("|")
+    acao = partes[1]
+
+    if acao == "close":
+        await query.answer("Fechado.")
+        await query.edit_message_text("📝 Editor de textos fechado.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if acao == "home":
+        await query.answer()
+        texto, markup = _montar_home_textos()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_HOME
+
+    if acao == "item":
+        chave = partes[2]
+        context.user_data["tx_chave"] = chave
+        await query.answer()
+        texto, markup = _montar_view_texto(chave)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_VIEW
+
+    if acao == "edit":
+        chave = context.user_data.get("tx_chave")
+        meta = TEXTOS_META[chave]
+        await query.answer()
+        await query.edit_message_text(
+            f"✏️ <b>Editando: {meta['titulo']}</b>\n\n"
+            f"Envie agora a <b>nova mensagem</b> (pode usar HTML como <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code> e <b>Emojis Premium do Telegram</b> diretamente):\n\n"
+            f"<b>Variáveis:</b> <code>{esc(meta['vars'])}</code>",
+            parse_mode="HTML"
+        )
+        return TX_EDIT_VAL
+
+    if acao == "reset":
+        chave = context.user_data.get("tx_chave")
+        remover_config_valor(chave)
+        await query.answer("Restaurado para o padrão!")
+        texto, markup = _montar_view_texto(chave)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_VIEW
+
+    if acao == "start_media":
+        await query.answer()
+        texto, markup = _montar_view_start_media()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_START_MEDIA
+
+    if acao == "del_start_media":
+        remover_config_valor("start_media_id")
+        remover_config_valor("start_media_type")
+        await query.answer("Mídia do /start removida!")
+        texto, markup = _montar_view_start_media()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_START_MEDIA
+
+    if acao == "tiers":
+        await query.answer()
+        texto, markup = _montar_view_tiers_emojis()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_TIERS_MENU
+
+    if acao == "tier":
+        t = int(partes[2])
+        context.user_data["tx_tier"] = t
+        await query.answer()
+        await query.edit_message_text(
+            f"🎨 Envie o <b>novo emoji</b> (normal ou <b>Premium do Telegram</b>) para <b>{TIERS_CONFIG[t]['nome']}</b>:",
+            parse_mode="HTML"
+        )
+        return TX_TIER_EDIT
+
+    return TX_HOME
+
+async def txmgr_receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return TX_EDIT_VAL
+
+    chave = context.user_data.get("tx_chave")
+    novo_html = extrair_html_com_custom_emojis(update.message).strip()
+    if not novo_html:
+        await update.message.reply_text("⚠️ Envie um texto válido.")
+        return TX_EDIT_VAL
+
+    try:
+        # Testa renderização HTML enviando uma prévia
+        salvar_config_valor(chave, novo_html)
+        texto, markup = _montar_view_texto(chave)
+        await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        remover_config_valor(chave)
+        await update.message.reply_text(
+            f"⚠️ Erro de formatação HTML no texto enviado ({esc(str(e))}).\n"
+            f"Verifique se fechou as tags <code>&lt;b&gt;</code> / <code>&lt;i&gt;</code> corretamente e tente novamente:",
+            parse_mode="HTML"
+        )
+        return TX_EDIT_VAL
+
+    return TX_VIEW
+
+async def txmgr_receber_start_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return TX_START_MEDIA
+
+    msg = update.message
+    if msg.animation:
+        salvar_config_valor("start_media_id", msg.animation.file_id)
+        salvar_config_valor("start_media_type", "animation")
+    elif msg.photo:
+        salvar_config_valor("start_media_id", msg.photo[-1].file_id)
+        salvar_config_valor("start_media_type", "photo")
+    else:
+        await msg.reply_text("⚠️ Envie um <b>GIF</b> ou <b>Foto</b> válido.", parse_mode="HTML")
+        return TX_START_MEDIA
+
+    texto, markup = _montar_view_start_media()
+    await msg.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return TX_START_MEDIA
+
+async def txmgr_receber_tier_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return TX_TIER_EDIT
+
+    t = context.user_data.get("tx_tier")
+    novo_emoji = extrair_html_com_custom_emojis(update.message).strip()
+    if not novo_emoji:
+        await update.message.reply_text("⚠️ Envie um emoji válido.")
+        return TX_TIER_EDIT
+
+    salvar_config_valor(f"tier_emoji_{t}", novo_emoji)
+    texto, markup = _montar_view_tiers_emojis()
+    await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return TX_TIERS_MENU
+
+async def txmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer("Fechado.")
+        await update.callback_query.edit_message_text("📝 Editor de textos fechado.")
+    else:
+        await update.message.reply_text("📝 Editor de textos fechado.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ==========================================
 # COMANDOS EXCLUSIVOS DE ADMIN (/studio)
 # ==========================================
 async def bloqueio_nao_admin(update: Update) -> bool:
@@ -2588,6 +3497,8 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /editcarta (ou <code>/editcarta ID</code>) — Assistente com botões e paginação para editar cartas\n"
         "• /catalogo — Listar cartas por categoria/subcategoria com paginação\n"
         "• /delcarta <code>ID</code> — Excluir uma carta\n\n"
+        "<b>Textos Públicos, GIF do /start & Emojis Premium:</b>\n"
+        "• /textos — Editar textos públicos, GIF do <code>/start</code> e emojis Premium dos Tiers\n\n"
         "<b>Molduras PNG por Tier (Opcional):</b>\n"
         "• /moldura <code>1 a 5</code> — Responda a um arquivo <b>.PNG transparente</b> para definir a moldura daquele Tier\n"
         "• /molduras — Ver quais Tiers têm moldura ativa\n"
@@ -2609,6 +3520,9 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📂 Categorias & Subs", callback_data="studio_go|categorias"),
+            InlineKeyboardButton("📝 Textos & /start", callback_data="studio_go|textos"),
+        ],
+        [
             InlineKeyboardButton("📜 Catálogo", callback_data="studio_go|catalogo"),
         ],
     ]
@@ -2950,6 +3864,33 @@ async def main():
     )
     app.add_handler(conv_catmgr)
 
+    # Gerenciador de textos públicos, GIF do /start e emojis Premium (/textos)
+    conv_txmgr = ConversationHandler(
+        entry_points=[
+            CommandHandler("textos", txmgr_start),
+            CallbackQueryHandler(txmgr_start, pattern=r"^studio_go\|textos$"),
+        ],
+        states={
+            TX_HOME: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(item\||start_media$|tiers$|close$)")],
+            TX_VIEW: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(edit$|reset$|home$)")],
+            TX_EDIT_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, txmgr_receber_texto)],
+            TX_START_MEDIA: [
+                MessageHandler(filters.ANIMATION | filters.PHOTO, txmgr_receber_start_media),
+                CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(del_start_media$|home$)"),
+            ],
+            TX_TIERS_MENU: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(tier\||home$)")],
+            TX_TIER_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, txmgr_receber_tier_emoji)],
+        },
+        fallbacks=[
+            CommandHandler("cancelar", txmgr_cancel),
+            CallbackQueryHandler(txmgr_cancel, pattern=r"^txmgr\|close$"),
+        ],
+        allow_reentry=True,
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(conv_txmgr)
+
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
@@ -2957,6 +3898,7 @@ async def main():
     app.add_handler(CommandHandler("girar", cmd_girar))
     app.add_handler(CommandHandler(["catalogo", "cartas"], cmd_catalogo))
     app.add_handler(CommandHandler("artista", cmd_artista))
+    app.add_handler(CommandHandler(["ranking", "top"], cmd_ranking))
     app.add_handler(CommandHandler("colecao", cmd_colecao))
     app.add_handler(CommandHandler("carta", cmd_carta))
     app.add_handler(CommandHandler("trocar", cmd_trocar))
@@ -2977,9 +3919,14 @@ async def main():
     # Botões Interativos do Jogo
     app.add_handler(CallbackQueryHandler(callback_girar_categoria, pattern=r"^rcat\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_subcategoria, pattern=r"^rsub\|"))
+    app.add_handler(CallbackQueryHandler(callback_girar_quantidade, pattern=r"^rqtd\|"))
+    app.add_handler(CallbackQueryHandler(callback_ranking_cid, pattern=r"^rank_cid\|"))
     app.add_handler(CallbackQueryHandler(callback_catalogo, pattern=r"^catlist\|"))
     app.add_handler(CallbackQueryHandler(cmd_catalogo, pattern=r"^studio_go\|catalogo$"))
     app.add_handler(CallbackQueryHandler(callback_troca, pattern=r"^trade\|"))
+
+    # Listener de quantidade personalizada de giros (group=1 para não conflitar com wizards admin)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_custom_spin_texto), group=1)
 
     async def handle_webhook(request):
         data = await request.json()
@@ -3004,10 +3951,11 @@ async def main():
 
     # Registra comandos no menu "/" do Telegram (essencial para grupos)
     await app.bot.set_my_commands([
-        BotCommand("girar", "Escolher categoria e sortear uma carta"),
+        BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
         BotCommand("colecao", "Ver toda a sua coleção"),
         BotCommand("catalogo", "Listar cartas por categoria"),
         BotCommand("artista", "Ver progresso dos 5 tiers de um artista"),
+        BotCommand("ranking", "Ver ranking de jogadores de um artista"),
         BotCommand("carta", "Visualizar uma carta pelo ID"),
         BotCommand("trocar", "Propor troca de cartas"),
         BotCommand("apelido", "Definir seu apelido único no jogo"),
