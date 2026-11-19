@@ -284,7 +284,10 @@ def init_pool():
             maxconn=12,
             dsn=DATABASE_URL,
             connect_timeout=10,
-            options="-c statement_timeout=15000",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
 
 def get_db():
@@ -313,7 +316,10 @@ def get_db():
     raw = psycopg2.connect(
         DATABASE_URL,
         connect_timeout=10,
-        options="-c statement_timeout=15000",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
     )
     return _PooledConn(None, raw, pooled=False)
 
