@@ -112,10 +112,14 @@ TEXTOS_PADRAO = {
     "troca_enviada": "✅ Proposta enviada para <b>{destinatario}</b>.",
     "troca_aceita": "✅ <b>Troca #{troca_id} concluída!</b>",
     "troca_recusada": "❌ Troca #{troca_id} recusada.",
+    "troca_status_privado": "🔔 Atualização da troca #{troca_id}: {status}.",
+    "troca_status_grupo": "🔔 {remetente} e {destinatario}: troca #{troca_id} {status}.",
     "doacao_prompt": "Escolha a carta que deseja doar para <b>{destinatario}</b>:",
     "doacao_quantidade": "Quantas cópias de <b>{carta}</b> deseja doar? Você tem {quantidade}.",
     "doacao_recebida": "🎁 Você recebeu {quantidade}x <b>{carta}</b> de <b>{remetente}</b>!",
     "doacao_enviada": "✅ Você doou {quantidade}x <b>{carta}</b> para <b>{destinatario}</b>.",
+    "doacao_privado_enviada": "🎁 Você doou {quantidade}x <b>{carta}</b> para <b>{destinatario}</b>.",
+    "doacao_grupo": "🎁 {remetente} doou {quantidade}x <b>{carta}</b> para {destinatario}!",
     "loja_menu": (
         "🫧 <b>EccoCoin</b>\n\nSaldo: <b>{saldo}</b> EccoCoins\nGiros: <b>{giros}</b>\n\n"
         "Venda cartas por 1 EccoCoin cada. Cada giro custa 10 EccoCoins."
@@ -171,10 +175,14 @@ TEXTOS_META = {
     "troca_enviada": {"titulo": "✅ Troca enviada", "vars": "{destinatario}"},
     "troca_aceita": {"titulo": "✅ Troca aceita", "vars": "{troca_id}"},
     "troca_recusada": {"titulo": "❌ Troca recusada", "vars": "{troca_id}"},
+    "troca_status_privado": {"titulo": "🔔 Atualização privada da troca", "vars": "{troca_id}, {status}"},
+    "troca_status_grupo": {"titulo": "🔔 Aviso de troca no grupo", "vars": "{remetente}, {destinatario}, {troca_id}, {status}"},
     "doacao_prompt": {"titulo": "🎁 Menu de doação", "vars": "{destinatario}"},
     "doacao_quantidade": {"titulo": "🎁 Quantidade da doação", "vars": "{carta}, {quantidade}"},
     "doacao_recebida": {"titulo": "🎁 Carta recebida", "vars": "{quantidade}, {carta}, {remetente}"},
     "doacao_enviada": {"titulo": "🎁 Doação concluída", "vars": "{quantidade}, {carta}, {destinatario}"},
+    "doacao_privado_enviada": {"titulo": "🎁 Confirmação privada de doação", "vars": "{quantidade}, {carta}, {destinatario}"},
+    "doacao_grupo": {"titulo": "🎁 Aviso de doação no grupo", "vars": "{remetente}, {destinatario}, {quantidade}, {carta}"},
     "loja_menu": {"titulo": "🫧 Menu da loja", "vars": "{saldo}, {giros}"},
     "loja_venda_prompt": {"titulo": "💿 Escolher carta para vender", "vars": "(sem variáveis)"},
     "loja_venda_quantidade": {"titulo": "💿 Quantidade para vender", "vars": "{quantidade}, {carta}"},
@@ -550,6 +558,7 @@ def iniciar_banco():
     """)
 
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aqua_coins INTEGER NOT NULL DEFAULT 0;")
+    cur.execute("ALTER TABLE trocas ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT;")
 
     cur.execute("""
         SELECT 1 FROM information_schema.columns
@@ -2514,6 +2523,46 @@ async def _mostrar_resultados_venda(query, context, user_id: int, busca: str, pa
     else:
         await query.reply_text(texto, reply_markup=markup, parse_mode="HTML")
 
+async def _mostrar_resultados_inventario(query, context, user_id: int, prefixo: str, busca: str, page: int = 0):
+    page_size = 10
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT c.id) FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id=%s AND i.quantidade>0 AND c.nome ILIKE %s", (user_id, f"%{busca}%"))
+    total = cur.fetchone()[0]
+    paginas = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, paginas - 1))
+    cur.execute("SELECT c.id, c.nome, c.tier, SUM(i.quantidade) FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id=%s AND i.quantidade>0 AND c.nome ILIKE %s GROUP BY c.id,c.nome,c.tier ORDER BY c.nome,c.tier,c.id LIMIT %s OFFSET %s", (user_id, f"%{busca}%", page_size, page * page_size))
+    itens = cur.fetchall()
+    cur.close()
+    conn.close()
+    key = f"{prefixo}_search_query"
+    context.user_data[key] = busca
+    botoes = []
+    linha = []
+    for cid, nome, tier, qtd in itens:
+        linha.append(InlineKeyboardButton(f"#{cid} {nome[:25]} T{tier} ×{qtd}", callback_data=f"{prefixo}|card|{cid}|0"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    if paginas > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefixo}|searchpage|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{paginas}", callback_data=f"{prefixo}|noop"))
+        if page + 1 < paginas:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefixo}|searchpage|{page + 1}"))
+        botoes.append(nav)
+    botoes.append([InlineKeyboardButton("🔍 Nova busca", callback_data=f"{prefixo}|search")])
+    teclado = InlineKeyboardMarkup(botoes)
+    texto = f"Cartas com <b>{esc(busca)}</b> — escolha uma:"
+    if hasattr(query, "answer"):
+        await query.answer()
+        await query.edit_message_text(texto if itens else "Não encontrei cartas com esse nome.", reply_markup=teclado, parse_mode="HTML")
+    else:
+        await query.reply_text(texto if itens else "Não encontrei cartas com esse nome.", reply_markup=teclado, parse_mode="HTML")
+
 async def _mostrar_opcoes_venda(query, context, carta_ids: list[int], nome: str, total: int, alltiers_id: int | None = None):
     context.user_data["loja_sale_cards"] = carta_ids
     context.user_data["loja_sale_name"] = nome
@@ -2754,6 +2803,19 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
     if not msg or not user or not msg.text:
         return
     busca = msg.text.strip()
+    if context.user_data.get("cm_search_pending"):
+        await catmgr_search_text(update, context)
+        raise ApplicationHandlerStop
+    if context.user_data.get("tradeui_search_pending"):
+        context.user_data["tradeui_search_pending"] = False
+        fluxo = context.user_data.get("tradeui", {})
+        dono_lista = fluxo.get("target_id") if fluxo.get("offered_id") else user.id
+        await _mostrar_resultados_inventario(msg, context, dono_lista, "tradeui", busca)
+        raise ApplicationHandlerStop
+    if context.user_data.get("doarui_search_pending"):
+        context.user_data["doarui_search_pending"] = False
+        await _mostrar_resultados_inventario(msg, context, user.id, "doarui", busca)
+        raise ApplicationHandlerStop
     if context.user_data.get("wishlist_search_pending"):
         context.user_data["wishlist_search_pending"] = False
         if not busca:
@@ -2892,6 +2954,8 @@ def _montar_botoes_inventario(user_id: int, prefixo: str, page: int = 0, itens_p
         if page + 1 < total_paginas:
             nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefixo}|page|{page + 1}"))
         botoes.append(nav)
+    if prefixo in ("tradeui", "doarui"):
+        botoes.append([InlineKeyboardButton("🔍 Pesquisar por nome", callback_data=f"{prefixo}|search")])
     botoes.append([InlineKeyboardButton("Cancelar", callback_data=f"{prefixo}|cancel")])
     return itens, InlineKeyboardMarkup(botoes), page, total
 
@@ -2966,6 +3030,7 @@ async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "sender_id": remetente.id,
         "target_id": destinatario_id,
         "target_name": (target_alias or (f"@{target_username}" if target_username else str(destinatario_id))),
+        "origin_group_id": msg.chat_id if msg.chat.type in ("group", "supergroup") else None,
     }
     await msg.reply_text(
         f"Escolha a carta que você oferece para <b>{esc(context.user_data['tradeui']['target_name'])}</b>:",
@@ -2981,6 +3046,15 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     partes = query.data.split("|")
     acao = partes[1]
+    if acao == "search":
+        context.user_data["tradeui_search_pending"] = True
+        await query.answer()
+        await query.edit_message_text("Digite o nome da carta que deseja oferecer ou receber:")
+        return
+    if acao == "searchpage":
+        dono_lista = fluxo["target_id"] if fluxo.get("offered_id") else query.from_user.id
+        await _mostrar_resultados_inventario(query, context, dono_lista, "tradeui", context.user_data.get("tradeui_search_query", ""), int(partes[2]))
+        return
     if acao == "cancel":
         context.user_data.pop("tradeui", None)
         await query.answer("Cancelado.")
@@ -3036,8 +3110,8 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("tradeui", None)
             return
         cur.execute(
-            "INSERT INTO trocas (remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id) VALUES (%s, %s, %s, %s) RETURNING id",
-            (query.from_user.id, fluxo["target_id"], fluxo["offered_id"], pedido_id),
+            "INSERT INTO trocas (remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, origin_chat_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (query.from_user.id, fluxo["target_id"], fluxo["offered_id"], pedido_id, fluxo.get("origin_group_id")),
         )
         troca_id = cur.fetchone()[0]
         conn.commit()
@@ -3077,6 +3151,25 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
+async def _avisar_troca_encerrada(bot, troca_id: int, rem_id: int, dest_id: int, origin_chat_id, status: str):
+    texto_privado = renderizar_template(obter_texto_publico("troca_status_privado"), troca_id=troca_id, status=esc(status))
+    # O destinatário já recebe o resultado editado no privado; envie a cópia ao proponente.
+    try:
+        await bot.send_message(chat_id=rem_id, text=texto_privado, parse_mode="HTML")
+    except Exception:
+        pass
+    if origin_chat_id:
+        nome_rem, _ = obter_apelido(rem_id, None)
+        nome_dest, _ = obter_apelido(dest_id, None)
+        try:
+            await bot.send_message(
+                chat_id=origin_chat_id,
+                text=renderizar_template(obter_texto_publico("troca_status_grupo"), remetente=esc(nome_rem), destinatario=esc(nome_dest), troca_id=troca_id, status=esc(status)),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
 async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     _, acao, troca_id_str = query.data.split("|")
@@ -3084,7 +3177,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, status FROM trocas WHERE id = %s FOR UPDATE", (troca_id,))
+    cur.execute("SELECT remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, status, origin_chat_id FROM trocas WHERE id = %s FOR UPDATE", (troca_id,))
     troca = cur.fetchone()
 
     if not troca or troca[4] != "pendente":
@@ -3093,7 +3186,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
-    rem_id, dest_id, c_oferecida, c_pedida, _ = troca
+    rem_id, dest_id, c_oferecida, c_pedida, _, origin_chat_id = troca
 
     if acao == "recusar":
         if query.from_user.id != dest_id:
@@ -3107,6 +3200,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         await query.answer("Troca recusada.")
         await query.edit_message_text(renderizar_template(obter_texto_publico("troca_recusada"), troca_id=troca_id), parse_mode="HTML")
+        await _avisar_troca_encerrada(context.bot, troca_id, rem_id, dest_id, origin_chat_id, "foi recusada")
         return
 
     if query.from_user.id != dest_id:
@@ -3136,6 +3230,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer("Troca concluída!")
     await query.edit_message_text(renderizar_template(obter_texto_publico("troca_aceita"), troca_id=troca_id), parse_mode="HTML")
+    await _avisar_troca_encerrada(context.bot, troca_id, rem_id, dest_id, origin_chat_id, "foi aceita")
 
 async def cmd_doar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -3163,7 +3258,10 @@ async def cmd_doar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Sua coleção está vazia; não há carta para doar.")
         return
     nome_destino = apelido or (f"@{username}" if username else str(destino_id))
-    context.user_data["doarui"] = {"sender_id": user.id, "target_id": destino_id, "target_name": nome_destino}
+    context.user_data["doarui"] = {
+        "sender_id": user.id, "target_id": destino_id, "target_name": nome_destino,
+        "origin_group_id": msg.chat_id if msg.chat.type in ("group", "supergroup") else None,
+    }
     await msg.reply_text(
         renderizar_template(obter_texto_publico("doacao_prompt"), destinatario=esc(nome_destino)),
         reply_markup=markup,
@@ -3178,6 +3276,14 @@ async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     partes = query.data.split("|")
     acao = partes[1]
+    if acao == "search":
+        context.user_data["doarui_search_pending"] = True
+        await query.answer()
+        await query.edit_message_text("Digite o nome da carta que deseja doar:")
+        return
+    if acao == "searchpage":
+        await _mostrar_resultados_inventario(query, context, query.from_user.id, "doarui", context.user_data.get("doarui_search_query", ""), int(partes[2]))
+        return
     if acao == "cancel":
         context.user_data.pop("doarui", None)
         await query.answer("Cancelado.")
@@ -3243,6 +3349,7 @@ async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
         nome_destino = fluxo["target_name"]
+        nome_remetente = obter_apelido(query.from_user.id, query.from_user.username)[0]
         avisou_destinatario = True
         try:
             await context.bot.send_message(
@@ -3251,12 +3358,30 @@ async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     obter_texto_publico("doacao_recebida"),
                     quantidade=quantidade,
                     carta=esc(carta[0]),
-                    remetente=esc(obter_apelido(query.from_user.id, query.from_user.username)[0]),
+                    remetente=esc(nome_remetente),
                 ),
                 parse_mode="HTML",
             )
         except Exception:
             avisou_destinatario = False
+        if fluxo.get("origin_group_id"):
+            try:
+                await context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=renderizar_template(obter_texto_publico("doacao_privado_enviada"), quantidade=quantidade, carta=esc(carta[0]), destinatario=esc(nome_destino)),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        if fluxo.get("origin_group_id"):
+            try:
+                await context.bot.send_message(
+                    chat_id=fluxo["origin_group_id"],
+                    text=renderizar_template(obter_texto_publico("doacao_grupo"), remetente=esc(nome_remetente), destinatario=esc(nome_destino), quantidade=quantidade, carta=esc(carta[0])),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
         context.user_data.pop("doarui", None)
         await query.answer("Doação concluída!")
         aviso = "" if avisou_destinatario else "\nNão consegui avisar em particular; peça para a pessoa abrir o bot com /start."
@@ -3378,7 +3503,7 @@ def montar_teclado_nomes(context: ContextTypes.DEFAULT_TYPE):
     botoes = []
     linha = []
     for idx, (nome_art, qtd_tiers) in enumerate(rows):
-        selo = "✅" if qtd_tiers >= 5 else f"{qtd_tiers}/5"
+        selo = ("✅" if qtd_tiers >= 5 else f"{qtd_tiers}/5") if categoria_usa_tiers(cat_id) else "tier único"
         linha.append(InlineKeyboardButton(f"{nome_art} ({selo})", callback_data=f"wiz_nome|{idx}"))
         if len(linha) == 2:
             botoes.append(linha)
@@ -3722,13 +3847,20 @@ async def wiz_escolher_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_escolhido,))
+    cur.execute("""
+        SELECT COUNT(*) FROM cartas
+        WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s
+          AND subcategoria_id IS NOT DISTINCT FROM %s
+          AND subsubcategoria_id IS NOT DISTINCT FROM %s
+    """, (nome_escolhido, context.user_data["cat_id"], context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
     total_tiers = cur.fetchone()[0]
+    modo_tiers = categoria_usa_tiers(context.user_data["cat_id"])
     cur.close()
     conn.close()
 
-    if total_tiers >= 5:
-        await query.answer(f"{nome_escolhido} já está completo (5/5 tiers)!", show_alert=True)
+    if (modo_tiers and total_tiers >= 5) or (not modo_tiers and total_tiers >= 1):
+        msg = "já está completo (5/5 tiers)!" if modo_tiers else "já tem sua carta única cadastrada nessa categoria!"
+        await query.answer(f"{nome_escolhido} {msg}", show_alert=True)
         return ST_NOME
 
     await query.answer()
@@ -3794,7 +3926,7 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cat_id = context.user_data["cat_id"]
-    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s", (nome_carta, cat_id))
+    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s AND subcategoria_id IS NOT DISTINCT FROM %s AND subsubcategoria_id IS NOT DISTINCT FROM %s", (nome_carta, cat_id, context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
     ocupados = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
@@ -3830,6 +3962,9 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = int(query.data.split("|")[1])
     nome_carta = context.user_data["nome_carta"]
     cat_id = context.user_data["cat_id"]
+    if not categoria_usa_tiers(cat_id) and tier != 1:
+        await query.answer("Essa categoria usa tier único.", show_alert=True)
+        return ST_TIER
     cat_nome = context.user_data["cat_nome"]
     sub_id = context.user_data.get("sub_id")
     sub_nome = context.user_data.get("sub_nome")
@@ -3875,17 +4010,25 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ <b>Carta cadastrada com sucesso!</b>\n\n"
         f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n"
         f"💿 <b>{cat_codigo}. {local_str}</b>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Cadastrar outra carta", callback_data="studio_go|addcarta")],
+            [InlineKeyboardButton("🛠️ Voltar ao Studio", callback_data="studio_menu")],
+        ]),
         parse_mode="HTML"
     )
     context.user_data.clear()
     return ConversationHandler.END
 
 async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta"), InlineKeyboardButton("🛠️ Painel Studio", callback_data="studio_menu")],
+        [InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta"), InlineKeyboardButton("📂 Categorias", callback_data="studio_go|categorias")],
+    ])
     if update.callback_query:
         await update.callback_query.answer("Cancelado.")
-        await update.callback_query.edit_message_text("❌ Cadastro de carta cancelado.")
+        await update.callback_query.edit_message_text("Cadastro cancelado. O que deseja fazer agora?", reply_markup=teclado)
     else:
-        await update.message.reply_text("❌ Cadastro de carta cancelado.")
+        await update.message.reply_text("Cadastro cancelado. O que deseja fazer agora?", reply_markup=teclado)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -3961,13 +4104,46 @@ def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMark
             nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"ed_page|{page + 1}"))
         botoes.append(nav)
 
-    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel")])
+    botoes.append([InlineKeyboardButton("🔍 Pesquisar carta por nome", callback_data="ed_search")])
+    botoes.append([InlineKeyboardButton("🛠️ Voltar ao Studio", callback_data="studio_menu")])
 
     texto = (
         f"🛠️ <b>Editar Carta</b> <i>(Página {page + 1}/{total_paginas} • {total} cartas)</i>\n\n"
         f"Escolha uma carta nos botões ou digite o <b>ID da carta</b>:"
     )
     return texto, InlineKeyboardMarkup(botoes)
+
+def _montar_resultados_edicao(busca: str, page: int = 0):
+    por_pagina = 10
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM cartas WHERE nome ILIKE %s", (f"%{busca}%",))
+    total = cur.fetchone()[0]
+    paginas = max(1, (total + por_pagina - 1) // por_pagina)
+    page = max(0, min(page, paginas - 1))
+    cur.execute("SELECT id, nome, tier FROM cartas WHERE nome ILIKE %s ORDER BY nome, tier, id LIMIT %s OFFSET %s", (f"%{busca}%", por_pagina, page * por_pagina))
+    cartas = cur.fetchall()
+    cur.close()
+    conn.close()
+    botoes = []
+    linha = []
+    for cid, nome, tier in cartas:
+        linha.append(InlineKeyboardButton(f"#{cid} {nome[:28]} T{tier}", callback_data=f"ed_pick|{cid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    if paginas > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"ed_searchpage|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{paginas}", callback_data="ed_noop"))
+        if page + 1 < paginas:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"ed_searchpage|{page + 1}"))
+        botoes.append(nav)
+    botoes.append([InlineKeyboardButton("🔍 Nova pesquisa", callback_data="ed_search"), InlineKeyboardButton("🔙 Lista completa", callback_data="ed_back_list")])
+    return f"Cartas encontradas para <b>{esc(busca)}</b> ({total}):", InlineKeyboardMarkup(botoes)
 
 def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
     t_cfg = TIERS_CONFIG[d["tier"]]
@@ -3999,6 +4175,8 @@ def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("✅ Salvar alterações", callback_data="ed_salvar"),
             InlineKeyboardButton("🔙 Lista de Cartas", callback_data="ed_back_list"),
         ],
+        [InlineKeyboardButton("🗑️ Excluir esta carta", callback_data="ed_delete")],
+        [InlineKeyboardButton("🛠️ Voltar ao Studio", callback_data="studio_menu")],
         [
             InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel"),
         ],
@@ -4039,7 +4217,13 @@ async def ed_receber_id_texto(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     alvo_raw = update.message.text.replace("#", "").strip()
     if not alvo_raw.isdigit():
-        await update.message.reply_text("⚠️ Envie um <b>ID numérico</b> válido (ex: <code>15</code>) ou toque em um botão.", parse_mode="HTML")
+        busca = alvo_raw.strip()
+        if not busca:
+            await update.message.reply_text("Digite o nome da carta que deseja localizar.")
+            return ED_MENU
+        context.user_data["ed_search_query"] = busca
+        texto, markup = _montar_resultados_edicao(busca)
+        await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
         return ED_MENU
 
     d = _carregar_carta_dict(int(alvo_raw))
@@ -4062,6 +4246,17 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return ED_MENU
 
+    if query.data == "studio_menu":
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta"), InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta")],
+            [InlineKeyboardButton("📂 Categorias & grupos", callback_data="studio_go|categorias"), InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],
+            [InlineKeyboardButton("📚 Catálogo", callback_data="studio_go|catalogo"), InlineKeyboardButton("📦 Mover artista", callback_data="studio_go|moverartista")],
+        ])
+        await query.answer()
+        await query.edit_message_text("🛠️ <b>Ecco-Mix Studio</b>\n\nEscolha o que deseja fazer:", reply_markup=teclado, parse_mode="HTML")
+        context.user_data.clear()
+        return ConversationHandler.END
+
     if query.data.startswith("ed_page|"):
         nova_pag = int(query.data.split("|")[1])
         context.user_data["ed_page"] = nova_pag
@@ -4077,6 +4272,19 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
         return ED_MENU
 
+    if query.data == "ed_search":
+        await query.answer()
+        await query.edit_message_text("Digite o nome completo ou um trecho do nome da carta:")
+        return ED_MENU
+
+    if query.data.startswith("ed_searchpage|"):
+        page = int(query.data.split("|")[1])
+        busca = context.user_data.get("ed_search_query", "")
+        texto, markup = _montar_resultados_edicao(busca, page)
+        await query.answer()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
     if query.data.startswith("ed_pick|"):
         cid = int(query.data.split("|")[1])
         d = _carregar_carta_dict(cid)
@@ -4087,6 +4295,40 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["ed_carta"] = d
         texto, markup = _montar_menu_edicao(d)
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    if query.data == "ed_delete":
+        d = context.user_data.get("ed_carta")
+        if not d:
+            await query.answer("Escolha uma carta primeiro.", show_alert=True)
+            return ED_MENU
+        teclado = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Confirmar exclusão", callback_data="ed_delete_confirm"), InlineKeyboardButton("Cancelar", callback_data="ed_delete_cancel")],
+        ])
+        await query.answer()
+        await query.edit_message_text(f"Excluir permanentemente <b>#{d['id']} {esc(d['nome'])}</b>? A carta também será removida das coleções e wishlists.", reply_markup=teclado, parse_mode="HTML")
+        return ED_MENU
+
+    if query.data == "ed_delete_cancel":
+        d = context.user_data.get("ed_carta")
+        await query.answer("Exclusão cancelada.")
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    if query.data == "ed_delete_confirm":
+        d = context.user_data.get("ed_carta")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM trocas WHERE status = 'pendente' AND (carta_oferecida_id = %s OR carta_pedida_id = %s)", (d["id"], d["id"]))
+        cur.execute("DELETE FROM cartas WHERE id = %s", (d["id"],))
+        conn.commit()
+        cur.close()
+        conn.close()
+        context.user_data.pop("ed_carta", None)
+        texto, markup = _montar_lista_selecao_edicao(context.user_data.get("ed_page", 0))
+        await query.answer("Carta excluída.")
+        await query.edit_message_text("Carta excluída.\n\n" + texto, reply_markup=markup, parse_mode="HTML")
         return ED_MENU
 
     d = context.user_data.get("ed_carta")
@@ -4127,7 +4369,11 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ <b>Carta #{d['id']} atualizada!</b>\n\n"
             f"{t_em} <b>{d['id']}. {esc(d['nome'])}.</b> <i>[{t_cfg['curto']}]</i>\n"
-            f"💿 <b>{cat_codigo}. {local_str}</b>",
+            f"💿 <b>{cat_codigo}. {local_str}</b>\n\nO que deseja fazer agora?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Editar outra carta", callback_data="studio_go|editcarta")],
+                [InlineKeyboardButton("🛠️ Voltar ao Studio", callback_data="studio_menu")],
+            ]),
             parse_mode="HTML"
         )
         context.user_data.clear()
@@ -4583,17 +4829,24 @@ async def ed_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ED_MENU
 
     novo_tier = int(query.data.split("|")[1])
+    if not categoria_usa_tiers(d["cat_id"]) and novo_tier != 1:
+        await query.answer("Essa categoria usa tier único.", show_alert=True)
+        return ED_TIER
     d["tier"] = novo_tier
     texto, markup = _montar_menu_edicao(d)
     await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
     return ED_MENU
 
 async def ed_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta"), InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta")],
+        [InlineKeyboardButton("🛠️ Painel Studio", callback_data="studio_menu")],
+    ])
     if update.callback_query:
         await update.callback_query.answer("Cancelado.")
-        await update.callback_query.edit_message_text("❌ Edição cancelada.")
+        await update.callback_query.edit_message_text("Edição cancelada. O que deseja fazer agora?", reply_markup=teclado)
     else:
-        await update.message.reply_text("❌ Edição cancelada.")
+        await update.message.reply_text("Edição cancelada. O que deseja fazer agora?", reply_markup=teclado)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -4626,8 +4879,10 @@ def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
     if linha:
         botoes.append(linha)
 
+    botoes.append([InlineKeyboardButton("🔍 Pesquisar categoria", callback_data="catmgr|search|cat")])
     botoes.append([InlineKeyboardButton("➕ Criar Nova Categoria", callback_data="catmgr|new_cat")])
     botoes.append([InlineKeyboardButton("❌ Fechar", callback_data="catmgr|close")])
+    botoes.append([InlineKeyboardButton("🛠️ Voltar ao Studio", callback_data="studio_menu")])
     linhas.append("\nToque em uma categoria para editar ou gerenciar subcategorias/grupos:")
     return "\n".join(linhas), InlineKeyboardMarkup(botoes)
 
@@ -4687,6 +4942,7 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
     else:
         linhas.append("<i>Nenhuma subcategoria cadastrada.</i>")
 
+    botoes.append([InlineKeyboardButton("🔍 Pesquisar subcategoria", callback_data="catmgr|search|sub")])
     botoes.append([
         InlineKeyboardButton("🗑️ Excluir Categoria", callback_data="catmgr|del_cat"),
         InlineKeyboardButton("⬅️ Voltar", callback_data="catmgr|home"),
@@ -4771,6 +5027,7 @@ def _montar_view_subcategoria(sub_id: int) -> tuple[str, InlineKeyboardMarkup] |
     else:
         linhas.append("<i>Nenhuma sub-subcategoria (grupo) cadastrada.</i>")
 
+    botoes.append([InlineKeyboardButton("🔍 Pesquisar grupo", callback_data="catmgr|search|subsub")])
     botoes.append([
         InlineKeyboardButton("🗑️ Excluir Subcategoria", callback_data="catmgr|del_sub"),
         InlineKeyboardButton("⬅️ Voltar", callback_data=f"catmgr|cat|{cat_id}"),
@@ -4834,6 +5091,20 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     partes = query.data.split("|")
     acao = partes[1]
+
+    if acao == "studio_menu":
+        await studio_menu_callback(update, context)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if acao == "search":
+        scope = partes[2]
+        context.user_data["cm_search_scope"] = scope
+        context.user_data["cm_search_pending"] = True
+        await query.answer()
+        tipo = {"cat": "categoria", "sub": "subcategoria", "subsub": "grupo"}.get(scope, "opção")
+        await query.edit_message_text(f"Digite o nome da {tipo} que deseja localizar:")
+        return {"cat": CM_HOME, "sub": CM_CAT_VIEW, "subsub": CM_SUB_VIEW}.get(scope, CM_HOME)
 
     if acao == "close":
         await query.answer("Fechado.")
@@ -5036,6 +5307,33 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CM_SUB_VIEW
 
     return CM_HOME
+
+async def catmgr_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("cm_search_pending") or update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_HOME
+    busca = update.effective_message.text.strip()
+    scope = context.user_data.get("cm_search_scope", "cat")
+    if scope == "cat":
+        sql, params, callback = "SELECT id, nome FROM categorias WHERE nome ILIKE %s ORDER BY nome LIMIT 50", (f"%{busca}%",), "catmgr|cat|{}"
+    elif scope == "sub":
+        sql, params, callback = "SELECT id, nome FROM subcategorias WHERE categoria_id=%s AND nome ILIKE %s ORDER BY nome LIMIT 50", (context.user_data.get("cm_cat_id"), f"%{busca}%"), "catmgr|sub|{}"
+    else:
+        sql, params, callback = "SELECT id, nome FROM subsubcategorias WHERE subcategoria_id=%s AND nome ILIKE %s ORDER BY nome LIMIT 50", (context.user_data.get("cm_sub_id"), f"%{busca}%"), "catmgr|subsub|{}"
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    encontrados = cur.fetchall()
+    cur.close()
+    conn.close()
+    botoes = [[InlineKeyboardButton(nome[:55], callback_data=callback.format(item_id))] for item_id, nome in encontrados]
+    if not encontrados:
+        await update.effective_message.reply_text("Não encontrei opções com esse nome. Tente outra busca.")
+        return {"cat": CM_HOME, "sub": CM_CAT_VIEW, "subsub": CM_SUB_VIEW}.get(scope, CM_HOME)
+    voltar = "catmgr|home" if scope == "cat" else (f"catmgr|cat|{context.user_data['cm_cat_id']}" if scope == "sub" else f"catmgr|sub|{context.user_data['cm_sub_id']}")
+    botoes.append([InlineKeyboardButton("🔍 Pesquisar novamente", callback_data=f"catmgr|search|{scope}"), InlineKeyboardButton("🔙 Voltar", callback_data=voltar)])
+    context.user_data["cm_search_pending"] = False
+    await update.effective_message.reply_text(f"Resultados para <b>{esc(busca)}</b>:", reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+    return {"cat": CM_HOME, "sub": CM_CAT_VIEW, "subsub": CM_SUB_VIEW}.get(scope, CM_HOME)
 
 async def catmgr_receber_nova_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != context.user_data.get("admin_id"):
@@ -5536,6 +5834,19 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     ]
     await update.effective_message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+
+async def studio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not eh_admin(query.from_user.id):
+        await query.answer("Apenas administradores podem abrir o Studio.", show_alert=True)
+        return
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta"), InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta")],
+        [InlineKeyboardButton("📂 Categorias & grupos", callback_data="studio_go|categorias"), InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],
+        [InlineKeyboardButton("📚 Catálogo", callback_data="studio_go|catalogo"), InlineKeyboardButton("📦 Mover artista", callback_data="studio_go|moverartista")],
+    ])
+    await query.answer()
+    await query.edit_message_text("🛠️ <b>Ecco-Mix Studio</b>\n\nEscolha o que deseja fazer:", reply_markup=teclado, parse_mode="HTML")
 
 async def cmd_set_moldura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
@@ -6297,7 +6608,7 @@ async def main():
         ],
         states={
             ED_MENU: [
-                CallbackQueryHandler(ed_menu_callback, pattern=r"^ed_(pick\||page\||back_list$|noop$|op\||salvar$)"),
+                CallbackQueryHandler(ed_menu_callback, pattern=r"^(ed_(pick\||page\||searchpage\||search$|delete(_confirm|_cancel)?$|back_list$|noop$|op\||salvar$)|studio_menu$)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_id_texto),
             ],
             ED_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nome)],
@@ -6329,11 +6640,11 @@ async def main():
             CallbackQueryHandler(catmgr_start, pattern=r"^studio_go\|categorias$"),
         ],
         states={
-            CM_HOME: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(cat\||new_cat$|home$|close$)")],
-            CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|toggle_tiers$|tiers_confirm$|tiers_cancel$|new_sub$|del_cat$|sub\||home$|close$)")],
+            CM_HOME: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(cat\||new_cat$|search\||home$|close$|studio_menu$)")],
+            CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|toggle_tiers$|tiers_confirm$|tiers_cancel$|new_sub$|del_cat$|search\||sub\||home$|close$|studio_menu$)")],
             CM_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_cat)],
             CM_REN_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_cat)],
-            CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|new_subsub$|del_sub$|subsub\||cat\||home$|close$)")],
+            CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|new_subsub$|del_sub$|search\||subsub\||cat\||home$|close$|studio_menu$)")],
             CM_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_sub)],
             CM_REN_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_sub)],
             CM_SUBSUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_subsub$|del_subsub$|sub\||home$|close$)")],
@@ -6407,6 +6718,7 @@ async def main():
 
     # Comandos de Admin (Studio)
     app.add_handler(CommandHandler("studio", cmd_studio_help))
+    app.add_handler(CallbackQueryHandler(studio_menu_callback, pattern=r"^studio_menu$"))
     app.add_handler(CommandHandler("moldura", cmd_set_moldura))
     app.add_handler(CommandHandler("remmoldura", cmd_rem_moldura))
     app.add_handler(CommandHandler("molduras", cmd_status_molduras))
