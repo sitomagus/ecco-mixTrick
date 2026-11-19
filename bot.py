@@ -64,7 +64,11 @@ TEXTOS_PADRAO = {
         "🍃 Giros disponíveis hoje: <b>{giros}</b>\n\n"
         "<b>Comandos disponíveis:</b>\n"
         "• /girar — Escolher uma categoria e sortear uma carta (ou <code>/girar tudo</code>)\n"
-        "• /apelido <code>nome</code> — Definir seu nome único de exibição no jogo\n"
+        "• /apelido <code>nome</code> — Definir seu nome único de exibição no jogo"
+        "{dica_apelido}"
+    ),
+    "comandos_texto": (
+        "📜 <b>Comandos do Ecco-Mix Trick</b>\n\n"
         "• /colecao — Ver toda a sua coleção agrupada\n"
         "• /catalogo — Ver todas as cartas cadastradas por categoria\n"
         "• /artista <code>nome</code> — Ver seu progresso nos 5 tiers de um artista/personagem\n"
@@ -72,8 +76,6 @@ TEXTOS_PADRAO = {
         "• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
         "• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
         "• /meuid — Ver seu ID numérico do Telegram"
-        "{dica_apelido}"
-        "{studio}"
     ),
     "menu_girar": (
         "🫧 <b>{apelido}</b> • 🍃 Giros restantes: <b>{giros}</b>\n"
@@ -100,7 +102,11 @@ TEXTOS_PADRAO = {
 TEXTOS_META = {
     "start_texto": {
         "titulo": "🚀 Texto do /start",
-        "vars": "{apelido}, {giros}, {dica_apelido}, {studio}",
+        "vars": "{apelido}, {giros}, {dica_apelido}",
+    },
+    "comandos_texto": {
+        "titulo": "📜 Texto do /comandos",
+        "vars": "(sem variáveis obrigatórias)",
     },
     "menu_girar": {
         "titulo": "🎰 Cabeçalho do /girar",
@@ -148,11 +154,14 @@ CATALOGO_INICIAL = {
     ST_ASK_SUB_CHOICE,
     ST_SUB,
     ST_NEW_SUB,
+    ST_ASK_SUBSUB_CHOICE,
+    ST_SUBSUB,
+    ST_NEW_SUBSUB,
     ST_NOME,
     ST_NEW_NOME,
     ST_MIDIA,
     ST_TIER,
-) = range(9)
+) = range(12)
 
 # Estados do assistente /editcarta
 (
@@ -163,9 +172,12 @@ CATALOGO_INICIAL = {
     ED_ASK_SUB,
     ED_SUB,
     ED_NEW_SUB,
+    ED_ASK_SUBSUB,
+    ED_SUBSUB,
+    ED_NEW_SUBSUB,
     ED_MIDIA,
     ED_TIER,
-) = range(9, 18)
+) = range(12, 24)
 
 # Estados do gerenciador /categorias
 (
@@ -176,7 +188,10 @@ CATALOGO_INICIAL = {
     CM_SUB_VIEW,
     CM_NEW_SUB,
     CM_REN_SUB,
-) = range(18, 25)
+    CM_SUBSUB_VIEW,
+    CM_NEW_SUBSUB,
+    CM_REN_SUBSUB,
+) = range(24, 34)
 
 # Estados do gerenciador de textos públicos /textos
 (
@@ -186,7 +201,7 @@ CATALOGO_INICIAL = {
     TX_START_MEDIA,
     TX_TIERS_MENU,
     TX_TIER_EDIT,
-) = range(25, 31)
+) = range(34, 40)
 
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
@@ -200,6 +215,23 @@ def renderizar_template(template: str, **kwargs) -> str:
     for k, v in kwargs.items():
         resultado = resultado.replace("{" + k + "}", str(v))
     return resultado
+
+def formatar_local_carta(
+    cid_cat: int,
+    nome_cat: str,
+    cid_sub: int | None,
+    nome_sub: str | None,
+    cid_subsub: int | None = None,
+    nome_subsub: str | None = None,
+) -> tuple[int, str]:
+    """Retorna (codigo_exibicao, caminho_formatado) suportando até 3 níveis."""
+    cat_codigo = cid_subsub if cid_subsub else (cid_sub if cid_sub else cid_cat)
+    partes = [esc(nome_cat)]
+    if nome_sub:
+        partes.append(esc(nome_sub))
+    if nome_subsub:
+        partes.append(esc(nome_subsub))
+    return cat_codigo, " • ".join(partes)
 
 def extrair_html_com_custom_emojis(message) -> str:
     """Converte o texto (ou legenda) da mensagem do admin em HTML preservando Emojis Premium (<tg-emoji>)."""
@@ -353,6 +385,12 @@ def iniciar_banco():
             nome TEXT NOT NULL,
             UNIQUE(categoria_id, nome)
         );
+        CREATE TABLE IF NOT EXISTS subsubcategorias (
+            id SERIAL PRIMARY KEY,
+            subcategoria_id INTEGER NOT NULL REFERENCES subcategorias(id) ON DELETE CASCADE,
+            nome TEXT NOT NULL,
+            UNIQUE(subcategoria_id, nome)
+        );
         CREATE TABLE IF NOT EXISTS molduras (
             tier INTEGER PRIMARY KEY CHECK (tier BETWEEN 1 AND 5),
             png_bytes BYTEA NOT NULL
@@ -374,6 +412,7 @@ def iniciar_banco():
             nome TEXT NOT NULL,
             categoria_id INTEGER NOT NULL REFERENCES categorias(id),
             subcategoria_id INTEGER REFERENCES subcategorias(id),
+            subsubcategoria_id INTEGER REFERENCES subsubcategorias(id),
             tier INTEGER NOT NULL CHECK (tier BETWEEN 1 AND 5),
             peso_drop INTEGER NOT NULL,
             file_id TEXT NOT NULL,
@@ -395,12 +434,21 @@ def iniciar_banco():
         );
     """)
 
+    # Migração segura: coluna apelido em usuarios
     cur.execute("""
         SELECT 1 FROM information_schema.columns
         WHERE table_name = 'usuarios' AND column_name = 'apelido'
     """)
     if not cur.fetchone():
         cur.execute("ALTER TABLE usuarios ADD COLUMN apelido TEXT;")
+
+    # Migração segura: coluna subsubcategoria_id em cartas (3º nível para grupos de K-pop, etc.)
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'cartas' AND column_name = 'subsubcategoria_id'
+    """)
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE cartas ADD COLUMN subsubcategoria_id INTEGER REFERENCES subsubcategorias(id);")
 
     cur.execute("""
         SELECT 1 FROM pg_indexes
@@ -414,7 +462,7 @@ def iniciar_banco():
         """)
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inventario_user_carta ON inventario (user_id, carta_id);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_cartas_cat_sub ON cartas (categoria_id, subcategoria_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cartas_cat_sub_subsub ON cartas (categoria_id, subcategoria_id, subsubcategoria_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cartas_lower_nome ON cartas (LOWER(nome));")
 
     cur.execute("SELECT COUNT(*) FROM categorias")
@@ -427,6 +475,18 @@ def iniciar_banco():
                     "INSERT INTO subcategorias (categoria_id, nome) VALUES (%s, %s)",
                     (cat_id, sub_nome)
                 )
+    else:
+        # Garante que a subcategoria K-pop exista dentro de Música mesmo em bancos já iniciados
+        cur.execute("SELECT id FROM categorias WHERE LOWER(nome) IN ('música', 'musica') LIMIT 1")
+        r_mus = cur.fetchone()
+        if r_mus:
+            mus_id = r_mus[0]
+            cur.execute(
+                "SELECT 1 FROM subcategorias WHERE categoria_id = %s AND LOWER(nome) IN ('k-pop', 'kpop') LIMIT 1",
+                (mus_id,)
+            )
+            if not cur.fetchone():
+                cur.execute("INSERT INTO subcategorias (categoria_id, nome) VALUES (%s, %s)", (mus_id, "K-pop"))
 
     conn.commit()
     cur.close()
@@ -618,7 +678,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\n\n💡 <i>Dica: use <code>/apelido SeuNome</code> para personalizar como seu nome aparece nas cartas.</i>"
         if not tem_apelido else ""
     )
-    studio_txt = "\n\n🛡️ <i>Modo Studio ativo: /studio</i>" if eh_admin(user.id) else ""
 
     template_start = obter_texto_publico("start_texto")
     texto = renderizar_template(
@@ -626,7 +685,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         apelido=esc(apelido),
         giros=giros,
         dica_apelido=dica_apelido,
-        studio=studio_txt,
+        studio="",
     )
 
     media_id = obter_config_valor("start_media_id", "")
@@ -640,6 +699,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(texto, parse_mode="HTML")
     else:
         await msg.reply_text(texto, parse_mode="HTML")
+
+async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    verificar_usuario(user.id, user.username)
+    texto = obter_texto_publico("comandos_texto")
+    await msg.reply_text(texto, parse_mode="HTML")
 
 async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -707,7 +776,7 @@ async def cmd_meu_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Seu ID numérico é: <code>{user.id}</code>", parse_mode="HTML")
 
 # ==========================================
-# SISTEMA DE GIROS (1x, MÚLTIPLO E GASTAR TUDO)
+# SISTEMA DE GIROS (1x, MÚLTIPLO E GASTAR TUDO — 3 NÍVEIS)
 # ==========================================
 async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -792,20 +861,20 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="⚠️ Não consegui exibir os botões neste grupo. Verifique se o bot tem permissão para enviar mensagens e usar teclados inline."
             )
 
-def _montar_teclado_qtd_giros(cat_alvo: str, sub_alvo: str, giros: int, dono_id: int) -> InlineKeyboardMarkup:
+def _montar_teclado_qtd_giros(cat_alvo: str, sub_alvo: str, subsub_alvo: str, giros: int, dono_id: int) -> InlineKeyboardMarkup:
     botoes = [
         [
-            InlineKeyboardButton("🎲 1x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|1|{dono_id}"),
-            InlineKeyboardButton(f"🔥 Todos ({giros}x)", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|all|{dono_id}"),
+            InlineKeyboardButton("🎲 1x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|{subsub_alvo}|1|{dono_id}"),
+            InlineKeyboardButton(f"🔥 Todos ({giros}x)", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|{subsub_alvo}|all|{dono_id}"),
         ]
     ]
     extras = []
     if giros > 3:
-        extras.append(InlineKeyboardButton("🎲 3x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|3|{dono_id}"))
+        extras.append(InlineKeyboardButton("🎲 3x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|{subsub_alvo}|3|{dono_id}"))
     if giros > 5:
-        extras.append(InlineKeyboardButton("🎲 5x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|5|{dono_id}"))
+        extras.append(InlineKeyboardButton("🎲 5x", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|{subsub_alvo}|5|{dono_id}"))
     if giros > 2:
-        extras.append(InlineKeyboardButton("✏️ Escolher qtd", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|custom|{dono_id}"))
+        extras.append(InlineKeyboardButton("✏️ Escolher qtd", callback_data=f"rqtd|{cat_alvo}|{sub_alvo}|{subsub_alvo}|custom|{dono_id}"))
     if extras:
         botoes.append(extras)
     return InlineKeyboardMarkup(botoes)
@@ -827,15 +896,15 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
 
     if cat_alvo == "all":
         if qtd_preset > 0:
-            await executar_sorteio(query, context, cat_id=None, sub_id=None, qtd_giros=min(qtd_preset, giros))
+            await executar_sorteio(query, context, cat_id=None, sub_id=None, subsub_id=None, qtd_giros=min(qtd_preset, giros))
             return
         if giros == 1:
-            await executar_sorteio(query, context, cat_id=None, sub_id=None, qtd_giros=1)
+            await executar_sorteio(query, context, cat_id=None, sub_id=None, subsub_id=None, qtd_giros=1)
             return
         await query.answer()
         await query.edit_message_text(
             f"🌐 <b>Mix Aleatório (Tudo)</b>\n🍃 Você tem <b>{giros}</b> giros. Quantos deseja gastar?",
-            reply_markup=_montar_teclado_qtd_giros("all", "all", giros, dono_id),
+            reply_markup=_montar_teclado_qtd_giros("all", "all", "all", giros, dono_id),
             parse_mode="HTML"
         )
         return
@@ -856,15 +925,15 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
 
     if not subs:
         if qtd_preset > 0:
-            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, qtd_giros=min(qtd_preset, giros))
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, subsub_id=None, qtd_giros=min(qtd_preset, giros))
             return
         if giros == 1:
-            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, qtd_giros=1)
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, subsub_id=None, qtd_giros=1)
             return
         await query.answer()
         await query.edit_message_text(
             f"💿 <b>{esc(cat_row[0])}</b>\n🍃 Você tem <b>{giros}</b> giros. Quantos deseja gastar?",
-            reply_markup=_montar_teclado_qtd_giros(str(cat_id), "all", giros, dono_id),
+            reply_markup=_montar_teclado_qtd_giros(str(cat_id), "all", "all", giros, dono_id),
             parse_mode="HTML"
         )
         return
@@ -904,26 +973,109 @@ async def callback_girar_subcategoria(update: Update, context: ContextTypes.DEFA
         return
 
     cat_id = int(cat_id_str)
-    sub_id = None if sub_alvo == "all" else int(sub_alvo)
+
+    if sub_alvo == "all":
+        if qtd_preset > 0:
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, subsub_id=None, qtd_giros=min(qtd_preset, giros))
+            return
+        if giros == 1:
+            await executar_sorteio(query, context, cat_id=cat_id, sub_id=None, subsub_id=None, qtd_giros=1)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            f"🍃 Você tem <b>{giros}</b> giros disponíveis. Quantos deseja gastar agora?",
+            reply_markup=_montar_teclado_qtd_giros(cat_id_str, "all", "all", giros, dono_id),
+            parse_mode="HTML"
+        )
+        return
+
+    sub_id = int(sub_alvo)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+    r_cat = cur.fetchone()
+    cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
+    r_sub = cur.fetchone()
+    cur.execute("SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s ORDER BY id ASC", (sub_id,))
+    subsubs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if subsubs:
+        cat_nome = r_cat[0] if r_cat else ""
+        sub_nome = r_sub[0] if r_sub else ""
+        botoes = []
+        linha = []
+        for subsub_id, subsub_nome in subsubs:
+            linha.append(InlineKeyboardButton(subsub_nome, callback_data=f"rsubsub|{cat_id}|{sub_id}|{subsub_id}|{qtd_preset}|{dono_id}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+
+        botoes.append([InlineKeyboardButton(f"🌐 Todos de {sub_nome}", callback_data=f"rsubsub|{cat_id}|{sub_id}|all|{qtd_preset}|{dono_id}")])
+
+        await query.answer()
+        await query.edit_message_text(
+            f"💿 <b>{esc(cat_nome)} • {esc(sub_nome)}</b> — Escolha o grupo / seção:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return
 
     if qtd_preset > 0:
-        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=min(qtd_preset, giros))
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, subsub_id=None, qtd_giros=min(qtd_preset, giros))
         return
 
     if giros == 1:
-        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=1)
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, subsub_id=None, qtd_giros=1)
         return
 
     await query.answer()
     await query.edit_message_text(
         f"🍃 Você tem <b>{giros}</b> giros disponíveis. Quantos deseja gastar agora?",
-        reply_markup=_montar_teclado_qtd_giros(cat_id_str, sub_alvo, giros, dono_id),
+        reply_markup=_montar_teclado_qtd_giros(cat_id_str, sub_alvo, "all", giros, dono_id),
+        parse_mode="HTML"
+    )
+
+async def callback_girar_subsubcategoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, cat_id_str, sub_id_str, subsub_alvo, qtd_str, dono_id_str = query.data.split("|")
+    dono_id = int(dono_id_str)
+    qtd_preset = int(qtd_str)
+
+    if query.from_user.id != dono_id:
+        await query.answer("Esse menu de giro não é seu!", show_alert=True)
+        return
+
+    giros = verificar_usuario(query.from_user.id, query.from_user.username)
+    if giros <= 0:
+        await query.answer("Seus giros acabaram!", show_alert=True)
+        return
+
+    cat_id = int(cat_id_str)
+    sub_id = int(sub_id_str)
+    subsub_id = None if subsub_alvo == "all" else int(subsub_alvo)
+
+    if qtd_preset > 0:
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, subsub_id=subsub_id, qtd_giros=min(qtd_preset, giros))
+        return
+
+    if giros == 1:
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, subsub_id=subsub_id, qtd_giros=1)
+        return
+
+    await query.answer()
+    await query.edit_message_text(
+        f"🍃 Você tem <b>{giros}</b> giros disponíveis. Quantos deseja gastar agora?",
+        reply_markup=_montar_teclado_qtd_giros(cat_id_str, sub_id_str, subsub_alvo, giros, dono_id),
         parse_mode="HTML"
     )
 
 async def callback_girar_quantidade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    _, cat_alvo, sub_alvo, qtd_modo, dono_id_str = query.data.split("|")
+    _, cat_alvo, sub_alvo, subsub_alvo, qtd_modo, dono_id_str = query.data.split("|")
     dono_id = int(dono_id_str)
 
     if query.from_user.id != dono_id:
@@ -937,6 +1089,7 @@ async def callback_girar_quantidade(update: Update, context: ContextTypes.DEFAUL
 
     cat_id = None if cat_alvo == "all" else int(cat_alvo)
     sub_id = None if sub_alvo == "all" else int(sub_alvo)
+    subsub_id = None if subsub_alvo == "all" else int(subsub_alvo)
 
     if qtd_modo == "custom":
         await query.answer()
@@ -945,6 +1098,7 @@ async def callback_girar_quantidade(update: Update, context: ContextTypes.DEFAUL
         pending[(chat_id, dono_id)] = {
             "cat_id": cat_id,
             "sub_id": sub_id,
+            "subsub_id": subsub_id,
             "menu_msg": query.message,
         }
         await query.edit_message_text(
@@ -954,7 +1108,7 @@ async def callback_girar_quantidade(update: Update, context: ContextTypes.DEFAUL
         return
 
     qtd_giros = giros if qtd_modo == "all" else min(int(qtd_modo), giros)
-    await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, qtd_giros=qtd_giros)
+    await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id, subsub_id=subsub_id, qtd_giros=qtd_giros)
 
 async def handler_custom_spin_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Recebe o número digitado quando o jogador escolhe 'Escolher qtd' no /girar."""
@@ -1002,11 +1156,12 @@ async def handler_custom_spin_texto(update: Update, context: ContextTypes.DEFAUL
         bot=context.bot,
         cat_id=dados["cat_id"],
         sub_id=dados["sub_id"],
+        subsub_id=dados.get("subsub_id"),
         qtd_giros=qtd,
         query=None,
     )
 
-async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None, qtd_giros: int = 1):
+async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None, subsub_id=None, qtd_giros: int = 1):
     await _processar_giros_core(
         user=query.from_user,
         chat_id=query.message.chat_id,
@@ -1016,6 +1171,7 @@ async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=Non
         bot=context.bot,
         cat_id=cat_id,
         sub_id=sub_id,
+        subsub_id=subsub_id,
         qtd_giros=qtd_giros,
         query=query,
     )
@@ -1029,6 +1185,7 @@ async def _processar_giros_core(
     bot,
     cat_id=None,
     sub_id=None,
+    subsub_id=None,
     qtd_giros: int = 1,
     query=None,
 ):
@@ -1059,17 +1216,24 @@ async def _processar_giros_core(
         cur = conn.cursor()
 
         sql_base = """
-            SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, c.tier, c.peso_drop, c.file_id, c.media_type
+            SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, subsub.id, subsub.nome,
+                   c.tier, c.peso_drop, c.file_id, c.media_type
             FROM cartas c
             JOIN categorias cat ON c.categoria_id = cat.id
             LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+            LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         """
         if cat_id is None:
             cur.execute(sql_base)
         elif sub_id is None:
             cur.execute(sql_base + " WHERE c.categoria_id = %s", (cat_id,))
-        else:
+        elif subsub_id is None:
             cur.execute(sql_base + " WHERE c.categoria_id = %s AND c.subcategoria_id = %s", (cat_id, sub_id))
+        else:
+            cur.execute(
+                sql_base + " WHERE c.categoria_id = %s AND c.subcategoria_id = %s AND c.subsubcategoria_id = %s",
+                (cat_id, sub_id, subsub_id)
+            )
 
         cartas = cur.fetchall()
         if not cartas:
@@ -1084,7 +1248,7 @@ async def _processar_giros_core(
         if query:
             await query.answer()
 
-        pesos = [c[7] for c in cartas]
+        pesos = [c[9] for c in cartas]
         sorteadas = random.choices(cartas, weights=pesos, k=qtd_efetiva)
 
         cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - %s WHERE user_id = %s", (qtd_efetiva, user.id))
@@ -1123,7 +1287,10 @@ async def _processar_giros_core(
 
         if qtd_efetiva == 1:
             c_tuple = sorteadas[0]
-            carta_id, nome_carta, cid_cat, nome_cat, cid_sub, nome_sub, tier, _, file_id, media_type = c_tuple
+            (
+                carta_id, nome_carta, cid_cat, nome_cat, cid_sub, nome_sub,
+                cid_subsub, nome_subsub, tier, _, file_id, media_type
+            ) = c_tuple
             st = status_por_carta[carta_id]
 
             cur.execute("""
@@ -1143,8 +1310,9 @@ async def _processar_giros_core(
 
             tier_info = TIERS_CONFIG[tier]
             tier_emoji = obter_emoji_tier(tier)
-            cat_codigo = cid_sub if cid_sub else cid_cat
-            local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
+            cat_codigo, local_str = formatar_local_carta(
+                cid_cat, nome_cat, cid_sub, nome_sub, cid_subsub, nome_subsub
+            )
 
             legenda = renderizar_template(
                 obter_texto_publico("giro_resultado"),
@@ -1173,8 +1341,8 @@ async def _processar_giros_core(
             cur.close()
             conn.close()
 
-            destaque_tuple = max(sorteadas, key=lambda x: x[6])
-            d_id, d_nome, _, _, _, _, d_tier, _, d_file, d_media = destaque_tuple
+            destaque_tuple = max(sorteadas, key=lambda x: x[8])
+            d_id, d_nome, _, _, _, _, _, _, d_tier, _, d_file, d_media = destaque_tuple
             destaque_emoji = obter_emoji_tier(d_tier)
             destaque_info = TIERS_CONFIG[d_tier]
 
@@ -1191,7 +1359,7 @@ async def _processar_giros_core(
             ]
 
             for cid, vezes in contagem_sorteio.items():
-                _, c_nome, _, _, _, _, c_tier, _, _, _ = mapa_cartas[cid]
+                _, c_nome, _, _, _, _, _, _, c_tier, _, _, _ = mapa_cartas[cid]
                 st = status_por_carta[cid]
                 em = obter_emoji_tier(c_tier)
                 t_c = TIERS_CONFIG[c_tier]["curto"]
@@ -1229,16 +1397,17 @@ def _montar_texto_ranking_artista(nome_oficial: str, caller_id: int) -> str:
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT cat.nome, sub.nome, COUNT(*)
+        SELECT cat.nome, sub.nome, subsub.nome, COUNT(*)
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         WHERE LOWER(c.nome) = LOWER(%s)
-        GROUP BY cat.nome, sub.nome
+        GROUP BY cat.nome, sub.nome, subsub.nome
         LIMIT 1
     """, (nome_oficial,))
     meta = cur.fetchone()
-    cat_nome, sub_nome, total_tiers_artista = meta if meta else ("", None, 5)
+    cat_nome, sub_nome, subsub_nome, total_tiers_artista = meta if meta else ("", None, None, 5)
 
     cur.execute("""
         SELECT
@@ -1259,7 +1428,7 @@ def _montar_texto_ranking_artista(nome_oficial: str, caller_id: int) -> str:
     cur.close()
     conn.close()
 
-    local_str = f"{esc(cat_nome)} • {esc(sub_nome)}" if sub_nome else esc(cat_nome)
+    _, local_str = formatar_local_carta(0, cat_nome, None, sub_nome, None, subsub_nome)
     linhas = [
         f"🏆 <b>Ranking — {esc(nome_oficial)}</b> <i>({local_str})</i>\n"
     ]
@@ -1371,7 +1540,7 @@ async def callback_ranking_cid(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(texto, parse_mode="HTML")
 
 # ==========================================
-# CATÁLOGO EM TEXTO COM BOTÕES E PAGINAÇÃO (/catalogo)
+# CATÁLOGO EM TEXTO COM BOTÕES E PAGINAÇÃO (/catalogo — 3 NÍVEIS)
 # ==========================================
 async def cmd_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1400,7 +1569,7 @@ async def cmd_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if linha:
         botoes.append(linha)
 
-    botoes.append([InlineKeyboardButton("🌐 Todas as Cartas", callback_data=f"catlist|view|all|all|0|{user.id}")])
+    botoes.append([InlineKeyboardButton("🌐 Todas as Cartas", callback_data=f"catlist|view|all|all|all|0|{user.id}")])
     botoes.append([InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{user.id}")])
 
     texto = "📜 <b>Catálogo de Cartas</b>\n\nSelecione uma <b>categoria</b> para ver a lista:"
@@ -1446,21 +1615,21 @@ async def callback_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not subs:
-            await _renderizar_lista_catalogo(query, cat_alvo=str(cat_id), sub_alvo="all", page=0, user_id=dono_id)
+            await _renderizar_lista_catalogo(query, cat_alvo=str(cat_id), sub_alvo="all", subsub_alvo="all", page=0, user_id=dono_id)
             return
 
         await query.answer()
         botoes = []
         linha = []
         for sid, snome in subs:
-            linha.append(InlineKeyboardButton(snome, callback_data=f"catlist|view|{cat_id}|{sid}|0|{dono_id}"))
+            linha.append(InlineKeyboardButton(snome, callback_data=f"catlist|sub|{cat_id}|{sid}|{dono_id}"))
             if len(linha) == 2:
                 botoes.append(linha)
                 linha = []
         if linha:
             botoes.append(linha)
 
-        botoes.append([InlineKeyboardButton(f"🌐 Todas de {cat_row[0]}", callback_data=f"catlist|view|{cat_id}|all|0|{dono_id}")])
+        botoes.append([InlineKeyboardButton(f"🌐 Todas de {cat_row[0]}", callback_data=f"catlist|view|{cat_id}|all|all|0|{dono_id}")])
         botoes.append([
             InlineKeyboardButton("⬅️ Categorias", callback_data=f"catlist|home|{dono_id}"),
             InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{dono_id}"),
@@ -1473,19 +1642,67 @@ async def callback_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if acao == "sub":
+        cat_id = int(partes[2])
+        sub_id = int(partes[3])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+        cat_row = cur.fetchone()
+        cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
+        sub_row = cur.fetchone()
+        cur.execute("SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s ORDER BY id ASC", (sub_id,))
+        subsubs = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not cat_row or not sub_row:
+            await query.answer("Subcategoria não encontrada.", show_alert=True)
+            return
+
+        if not subsubs:
+            await _renderizar_lista_catalogo(query, cat_alvo=str(cat_id), sub_alvo=str(sub_id), subsub_alvo="all", page=0, user_id=dono_id)
+            return
+
+        await query.answer()
+        botoes = []
+        linha = []
+        for ssid, ssnome in subsubs:
+            linha.append(InlineKeyboardButton(ssnome, callback_data=f"catlist|view|{cat_id}|{sub_id}|{ssid}|0|{dono_id}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+
+        botoes.append([InlineKeyboardButton(f"🌐 Todas de {sub_row[0]}", callback_data=f"catlist|view|{cat_id}|{sub_id}|all|0|{dono_id}")])
+        botoes.append([
+            InlineKeyboardButton("⬅️ Subcategorias", callback_data=f"catlist|cat|{cat_id}|{dono_id}"),
+            InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{dono_id}"),
+        ])
+
+        await query.edit_message_text(
+            f"💿 <b>{esc(cat_row[0])} • {esc(sub_row[0])}</b>\n\nEscolha o <b>grupo / seção</b> para listar as cartas:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return
+
     if acao == "view":
         cat_alvo = partes[2]
         sub_alvo = partes[3]
-        page = int(partes[4])
-        await _renderizar_lista_catalogo(query, cat_alvo=cat_alvo, sub_alvo=sub_alvo, page=page, user_id=dono_id)
+        subsub_alvo = partes[4]
+        page = int(partes[5])
+        await _renderizar_lista_catalogo(query, cat_alvo=cat_alvo, sub_alvo=sub_alvo, subsub_alvo=subsub_alvo, page=page, user_id=dono_id)
 
-async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: int, user_id: int):
+async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub_alvo: str, page: int, user_id: int):
     conn = get_db()
     cur = conn.cursor()
 
     titulo = "Todas as Cartas"
     where_sql = ""
     params: list = []
+    tem_subsubs_na_sub = False
 
     if cat_alvo != "all":
         cat_id = int(cat_alvo)
@@ -1502,9 +1719,21 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: 
             cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
             r_sub = cur.fetchone()
             sub_nome = r_sub[0] if r_sub else f"Sub #{sub_id}"
-            titulo = f"{esc(cat_nome)} • {esc(sub_nome)}"
-            where_sql = "WHERE c.categoria_id = %s AND c.subcategoria_id = %s"
-            params = [cat_id, sub_id]
+            cur.execute("SELECT COUNT(*) FROM subsubcategorias WHERE subcategoria_id = %s", (sub_id,))
+            tem_subsubs_na_sub = cur.fetchone()[0] > 0
+
+            if subsub_alvo == "all":
+                titulo = f"{esc(cat_nome)} • {esc(sub_nome)}"
+                where_sql = "WHERE c.categoria_id = %s AND c.subcategoria_id = %s"
+                params = [cat_id, sub_id]
+            else:
+                subsub_id = int(subsub_alvo)
+                cur.execute("SELECT nome FROM subsubcategorias WHERE id = %s", (subsub_id,))
+                r_subsub = cur.fetchone()
+                subsub_nome = r_subsub[0] if r_subsub else f"Grupo #{subsub_id}"
+                titulo = f"{esc(cat_nome)} • {esc(sub_nome)} • {esc(subsub_nome)}"
+                where_sql = "WHERE c.categoria_id = %s AND c.subcategoria_id = %s AND c.subsubcategoria_id = %s"
+                params = [cat_id, sub_id, subsub_id]
 
     cur.execute(f"SELECT COUNT(*) FROM cartas c {where_sql}", tuple(params))
     total = cur.fetchone()[0]
@@ -1520,10 +1749,11 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: 
     offset = page * CAT_PAGE_SIZE
 
     cur.execute(f"""
-        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome
+        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome, subsub.nome
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         {where_sql}
         ORDER BY c.nome ASC, c.tier ASC, c.id ASC
         LIMIT %s OFFSET %s
@@ -1541,28 +1771,31 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: 
         f"📜 <b>Catálogo — {titulo}</b>",
         f"📦 <b>{total}</b> cartas | Página <b>{page + 1}/{total_paginas}</b>\n",
     ]
-    for cid, nome, tier, c_nome, s_nome in rows:
+    for cid, nome, tier, c_nome, s_nome, ss_nome in rows:
         t_cfg = TIERS_CONFIG[tier]
         t_em = obter_emoji_tier(tier)
         marca = " ✅" if cid in possuidas else ""
         extra_local = ""
-        if cat_alvo == "all":
-            loc = f"{c_nome} • {s_nome}" if s_nome else c_nome
-            extra_local = f" <i>({esc(loc)})</i>"
+        if cat_alvo == "all" or (subsub_alvo == "all" and ss_nome):
+            _, loc = formatar_local_carta(0, c_nome, None, s_nome, None, ss_nome)
+            extra_local = f" <i>({loc})</i>"
         linhas.append(f"{t_em} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{t_cfg['curto']}</i>{extra_local}{marca}")
 
     botoes = []
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{page - 1}|{user_id}"))
+        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{subsub_alvo}|{page - 1}|{user_id}"))
     if page + 1 < total_paginas:
-        nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{page + 1}|{user_id}"))
+        nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{subsub_alvo}|{page + 1}|{user_id}"))
     if nav:
         botoes.append(nav)
 
-    rodape = [InlineKeyboardButton("🔙 Categorias", callback_data=f"catlist|home|{user_id}")]
+    rodape = []
+    if sub_alvo != "all" and tem_subsubs_na_sub:
+        rodape.append(InlineKeyboardButton("🏷️ Grupos", callback_data=f"catlist|sub|{cat_alvo}|{sub_alvo}|{user_id}"))
     if cat_alvo != "all":
-        rodape.insert(0, InlineKeyboardButton("📂 Subcategorias", callback_data=f"catlist|cat|{cat_alvo}|{user_id}"))
+        rodape.append(InlineKeyboardButton("📂 Subcategorias", callback_data=f"catlist|cat|{cat_alvo}|{user_id}"))
+    rodape.append(InlineKeyboardButton("🔙 Categorias", callback_data=f"catlist|home|{user_id}"))
     rodape.append(InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{user_id}"))
     botoes.append(rodape)
 
@@ -1589,10 +1822,11 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT c.id, c.nome, cat.nome, sub.nome, c.tier
+        SELECT c.id, c.nome, cat.nome, sub.nome, subsub.nome, c.tier
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         WHERE LOWER(c.nome) = LOWER(%s)
         ORDER BY c.tier ASC
     """, (busca,))
@@ -1600,10 +1834,11 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not cartas:
         cur.execute("""
-            SELECT c.id, c.nome, cat.nome, sub.nome, c.tier
+            SELECT c.id, c.nome, cat.nome, sub.nome, subsub.nome, c.tier
             FROM cartas c
             JOIN categorias cat ON c.categoria_id = cat.id
             LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+            LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
             WHERE LOWER(c.nome) LIKE LOWER(%s)
             ORDER BY c.nome ASC, c.tier ASC
         """, (f"%{busca}%",))
@@ -1620,7 +1855,8 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     primeiro_cid = cartas[0][0]
     cat_nome = cartas[0][2]
     sub_nome = cartas[0][3]
-    mapa_tiers = {c[4]: c[0] for c in cartas}
+    subsub_nome = cartas[0][4]
+    mapa_tiers = {c[5]: c[0] for c in cartas}
 
     cur.execute("""
         SELECT c.tier, i.quantidade
@@ -1632,7 +1868,7 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.close()
     conn.close()
 
-    local_str = f"{esc(cat_nome)} • {esc(sub_nome)}" if sub_nome else esc(cat_nome)
+    _, local_str = formatar_local_carta(0, cat_nome, None, sub_nome, None, subsub_nome)
     obtidas = len(posse)
     total = len(mapa_tiers)
 
@@ -1715,10 +1951,12 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, c.tier, c.file_id, c.media_type
+        SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, subsub.id, subsub.nome,
+               c.tier, c.file_id, c.media_type
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         WHERE c.id = %s
     """, (carta_id,))
     carta = cur.fetchone()
@@ -1729,11 +1967,10 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Carta não encontrada.")
         return
 
-    cid, nome, cid_cat, nome_cat, cid_sub, nome_sub, tier, file_id, media_type = carta
+    cid, nome, cid_cat, nome_cat, cid_sub, nome_sub, cid_subsub, nome_subsub, tier, file_id, media_type = carta
     t_cfg = TIERS_CONFIG[tier]
     t_em = obter_emoji_tier(tier)
-    cat_codigo = cid_sub if cid_sub else cid_cat
-    local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
+    cat_codigo, local_str = formatar_local_carta(cid_cat, nome_cat, cid_sub, nome_sub, cid_subsub, nome_subsub)
     legenda = (
         f"{t_em} <b>{cid}. {esc(nome)}.</b>\n"
         f"💿 <b>{cat_codigo}. {local_str}</b>\n"
@@ -1919,7 +2156,7 @@ async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"✅ <b>Troca #{troca_id} concluída!</b>", parse_mode="HTML")
 
 # ==========================================
-# ASSISTENTE INTERATIVO /addcarta (ESTILO @STICKERS)
+# ASSISTENTE INTERATIVO /addcarta (SUPORTE A 3 NÍVEIS)
 # ==========================================
 def montar_teclado_categorias():
     conn = get_db()
@@ -1965,9 +2202,33 @@ def montar_teclado_subcategorias(cat_id: int):
     botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")])
     return InlineKeyboardMarkup(botoes)
 
+def montar_teclado_subsubcategorias(sub_id: int, sub_nome: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s ORDER BY id ASC", (sub_id,))
+    subsubs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    botoes = []
+    linha = []
+    for ssid, ssnome in subsubs:
+        linha.append(InlineKeyboardButton(ssnome, callback_data=f"wiz_subsub|{ssid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+
+    botoes.append([InlineKeyboardButton("➕ Criar nova sub-subcategoria (grupo)", callback_data="wiz_new_subsub")])
+    botoes.append([InlineKeyboardButton(f"➡️ Sem grupo (direto em {sub_nome})", callback_data="wiz_no_subsub")])
+    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")])
+    return InlineKeyboardMarkup(botoes)
+
 def montar_teclado_nomes(context: ContextTypes.DEFAULT_TYPE):
     cat_id = context.user_data["cat_id"]
     sub_id = context.user_data.get("sub_id")
+    subsub_id = context.user_data.get("subsub_id")
 
     conn = get_db()
     cur = conn.cursor()
@@ -1979,14 +2240,22 @@ def montar_teclado_nomes(context: ContextTypes.DEFAULT_TYPE):
             GROUP BY LOWER(nome)
             ORDER BY MIN(nome) ASC
         """, (cat_id,))
+    elif subsub_id is None:
+        cur.execute("""
+            SELECT MIN(nome), COUNT(*)
+            FROM cartas
+            WHERE categoria_id = %s AND subcategoria_id = %s AND subsubcategoria_id IS NULL
+            GROUP BY LOWER(nome)
+            ORDER BY MIN(nome) ASC
+        """, (cat_id, sub_id))
     else:
         cur.execute("""
             SELECT MIN(nome), COUNT(*)
             FROM cartas
-            WHERE categoria_id = %s AND subcategoria_id = %s
+            WHERE categoria_id = %s AND subcategoria_id = %s AND subsubcategoria_id = %s
             GROUP BY LOWER(nome)
             ORDER BY MIN(nome) ASC
-        """, (cat_id, sub_id))
+        """, (cat_id, sub_id, subsub_id))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -2005,6 +2274,8 @@ def montar_teclado_nomes(context: ContextTypes.DEFAULT_TYPE):
         botoes.append(linha)
 
     botoes.append([InlineKeyboardButton("➕ Criar novo nome", callback_data="wiz_new_nome")])
+    if sub_id is not None and subsub_id is None:
+        botoes.append([InlineKeyboardButton("🏷️ Criar sub-subcategoria (grupo)", callback_data="wiz_new_subsub_from_nome")])
     botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")])
     return InlineKeyboardMarkup(botoes)
 
@@ -2050,6 +2321,8 @@ async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cat_nome"] = cat_nome
     context.user_data["sub_id"] = None
     context.user_data["sub_nome"] = None
+    context.user_data["subsub_id"] = None
+    context.user_data["subsub_nome"] = None
 
     if tem_subs:
         await query.edit_message_text(
@@ -2091,6 +2364,8 @@ async def wiz_receber_nova_cat(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["cat_nome"] = cat_oficial
     context.user_data["sub_id"] = None
     context.user_data["sub_nome"] = None
+    context.user_data["subsub_id"] = None
+    context.user_data["subsub_nome"] = None
 
     botoes = [
         [InlineKeyboardButton("➕ Criar subcategoria", callback_data="wiz_sub_sim")],
@@ -2139,11 +2414,24 @@ async def wiz_escolher_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
     sub_nome = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM subsubcategorias WHERE subcategoria_id = %s", (sub_id,))
+    tem_subsubs = cur.fetchone()[0] > 0
     cur.close()
     conn.close()
 
     context.user_data["sub_id"] = sub_id
     context.user_data["sub_nome"] = sub_nome
+    context.user_data["subsub_id"] = None
+    context.user_data["subsub_nome"] = None
+
+    if tem_subsubs:
+        await query.edit_message_text(
+            f"📂 <b>{esc(context.user_data['cat_nome'])} • {esc(sub_nome)}</b>\n\n"
+            f"Escolha a <b>sub-subcategoria (grupo)</b> ou crie uma nova:",
+            reply_markup=montar_teclado_subsubcategorias(sub_id, sub_nome),
+            parse_mode="HTML"
+        )
+        return ST_SUBSUB
 
     await query.edit_message_text(
         f"📂 <b>{esc(context.user_data['cat_nome'])} • {esc(sub_nome)}</b>\n\n"
@@ -2182,9 +2470,113 @@ async def wiz_receber_nova_sub(update: Update, context: ContextTypes.DEFAULT_TYP
 
     context.user_data["sub_id"] = sub_id
     context.user_data["sub_nome"] = sub_oficial
+    context.user_data["subsub_id"] = None
+    context.user_data["subsub_nome"] = None
+
+    botoes = [
+        [InlineKeyboardButton("➕ Criar sub-subcategoria (grupo)", callback_data="wiz_subsub_sim")],
+        [InlineKeyboardButton("➡️ Sem grupo (ir para nomes)", callback_data="wiz_subsub_nao")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")],
+    ]
+    await update.message.reply_text(
+        f"✅ Subcategoria <b>{esc(sub_oficial)}</b> pronta!\n\nEssa subcategoria vai ter sub-subcategorias (grupos)?",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
+    )
+    return ST_ASK_SUBSUB_CHOICE
+
+async def wiz_decidir_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ST_ASK_SUBSUB_CHOICE
+
+    await query.answer()
+    if query.data == "wiz_subsub_sim":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova sub-subcategoria (grupo)</b>:", parse_mode="HTML")
+        return ST_NEW_SUBSUB
+
+    await query.edit_message_text(
+        f"📂 <b>{esc(context.user_data['cat_nome'])} • {esc(context.user_data['sub_nome'])}</b>\n\n"
+        f"<b>Passo 3/5</b> — Selecione um nome ou clique em <b>Criar novo nome</b>:",
+        reply_markup=montar_teclado_nomes(context),
+        parse_mode="HTML"
+    )
+    return ST_NOME
+
+async def wiz_escolher_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ST_SUBSUB
+
+    await query.answer()
+    if query.data == "wiz_new_subsub":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova sub-subcategoria (grupo)</b>:", parse_mode="HTML")
+        return ST_NEW_SUBSUB
+
+    if query.data == "wiz_no_subsub":
+        context.user_data["subsub_id"] = None
+        context.user_data["subsub_nome"] = None
+        await query.edit_message_text(
+            f"📂 <b>{esc(context.user_data['cat_nome'])} • {esc(context.user_data['sub_nome'])}</b>\n\n"
+            f"<b>Passo 3/5</b> — Selecione um artista/nome ou clique em <b>Criar novo nome</b>:",
+            reply_markup=montar_teclado_nomes(context),
+            parse_mode="HTML"
+        )
+        return ST_NOME
+
+    subsub_id = int(query.data.split("|")[1])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM subsubcategorias WHERE id = %s", (subsub_id,))
+    subsub_nome = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+
+    context.user_data["subsub_id"] = subsub_id
+    context.user_data["subsub_nome"] = subsub_nome
+
+    await query.edit_message_text(
+        f"📂 <b>{esc(context.user_data['cat_nome'])} • {esc(context.user_data['sub_nome'])} • {esc(subsub_nome)}</b>\n\n"
+        f"<b>Passo 3/5</b> — Selecione um integrante/artista ou clique em <b>Criar novo nome</b>:",
+        reply_markup=montar_teclado_nomes(context),
+        parse_mode="HTML"
+    )
+    return ST_NOME
+
+async def wiz_receber_nova_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ST_NEW_SUBSUB
+
+    subsub_nome = update.message.text.strip()
+    sub_id = context.user_data["sub_id"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s AND LOWER(nome) = LOWER(%s)",
+        (sub_id, subsub_nome)
+    )
+    existente = cur.fetchone()
+    if existente:
+        subsub_id, subsub_oficial = existente
+    else:
+        cur.execute(
+            "INSERT INTO subsubcategorias (subcategoria_id, nome) VALUES (%s, %s) RETURNING id",
+            (sub_id, subsub_nome)
+        )
+        subsub_id = cur.fetchone()[0]
+        subsub_oficial = subsub_nome
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    context.user_data["subsub_id"] = subsub_id
+    context.user_data["subsub_nome"] = subsub_oficial
 
     await update.message.reply_text(
-        f"✅ Subcategoria <b>{esc(sub_oficial)}</b> criada!\n\n"
+        f"✅ Sub-subcategoria <b>{esc(subsub_oficial)}</b> pronta!\n\n"
         f"<b>Passo 3/5</b> — Selecione um nome ou clique em <b>Criar novo nome</b>:",
         reply_markup=montar_teclado_nomes(context),
         parse_mode="HTML"
@@ -2197,9 +2589,14 @@ async def wiz_escolher_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Esse menu pertence a outro admin.", show_alert=True)
         return ST_NOME
 
+    if query.data == "wiz_new_subsub_from_nome":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>nome da nova sub-subcategoria (grupo)</b>:", parse_mode="HTML")
+        return ST_NEW_SUBSUB
+
     if query.data == "wiz_new_nome":
         await query.answer()
-        await query.edit_message_text("✏️ Digite o <b>nome do novo artista / personagem</b>:", parse_mode="HTML")
+        await query.edit_message_text("✏️ Digite o <b>nome do novo artista / integrante / personagem</b>:", parse_mode="HTML")
         return ST_NEW_NOME
 
     idx = int(query.data.split("|")[1])
@@ -2321,6 +2718,8 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_nome = context.user_data["cat_nome"]
     sub_id = context.user_data.get("sub_id")
     sub_nome = context.user_data.get("sub_nome")
+    subsub_id = context.user_data.get("subsub_id")
+    subsub_nome = context.user_data.get("subsub_nome")
     raw_file_id = context.user_data["raw_file_id"]
     media_type = context.user_data["media_type"]
 
@@ -2346,9 +2745,9 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO cartas (nome, categoria_id, subcategoria_id, tier, peso_drop, file_id, media_type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (nome_carta, cat_id, sub_id, tier, peso, final_file_id, media_type))
+        INSERT INTO cartas (nome, categoria_id, subcategoria_id, subsubcategoria_id, tier, peso_drop, file_id, media_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (nome_carta, cat_id, sub_id, subsub_id, tier, peso, final_file_id, media_type))
     nova_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
@@ -2356,8 +2755,7 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     t_cfg = TIERS_CONFIG[tier]
     t_em = obter_emoji_tier(tier)
-    cat_codigo = sub_id if sub_id else cat_id
-    local_str = f"{esc(cat_nome)} • {esc(sub_nome)}" if sub_nome else esc(cat_nome)
+    cat_codigo, local_str = formatar_local_carta(cat_id, cat_nome, sub_id, sub_nome, subsub_id, subsub_nome)
     await query.message.reply_text(
         f"✅ <b>Carta cadastrada com sucesso!</b>\n\n"
         f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n"
@@ -2377,17 +2775,18 @@ async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
-# ASSISTENTE INTERATIVO /editcarta (COM PAGINAÇÃO)
+# ASSISTENTE INTERATIVO /editcarta (COM PAGINAÇÃO & 3 NÍVEIS)
 # ==========================================
 def _carregar_carta_dict(carta_id: int) -> dict | None:
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         SELECT c.id, c.nome, c.categoria_id, cat.nome, c.subcategoria_id, sub.nome,
-               c.tier, c.file_id, c.media_type
+               c.subsubcategoria_id, subsub.nome, c.tier, c.file_id, c.media_type
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
         WHERE c.id = %s
     """, (carta_id,))
     row = cur.fetchone()
@@ -2402,9 +2801,11 @@ def _carregar_carta_dict(carta_id: int) -> dict | None:
         "cat_nome": row[3],
         "sub_id": row[4],
         "sub_nome": row[5],
-        "tier": row[6],
-        "file_id": row[7],
-        "media_type": row[8],
+        "subsub_id": row[6],
+        "subsub_nome": row[7],
+        "tier": row[8],
+        "file_id": row[9],
+        "media_type": row[10],
     }
 
 def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -2456,8 +2857,9 @@ def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMark
 def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
     t_cfg = TIERS_CONFIG[d["tier"]]
     t_em = obter_emoji_tier(d["tier"])
-    cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
-    local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
+    cat_codigo, local_str = formatar_local_carta(
+        d["cat_id"], d["cat_nome"], d["sub_id"], d["sub_nome"], d.get("subsub_id"), d.get("subsub_nome")
+    )
     midia_label = "GIF" if d["media_type"] == "animation" else f"Foto ({LARGURA_CARTA}×{ALTURA_CARTA})"
 
     texto = (
@@ -2591,10 +2993,10 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         peso = TIERS_CONFIG[d["tier"]]["peso"]
         cur.execute("""
             UPDATE cartas
-            SET nome = %s, categoria_id = %s, subcategoria_id = %s, tier = %s,
-                peso_drop = %s, file_id = %s, media_type = %s
+            SET nome = %s, categoria_id = %s, subcategoria_id = %s, subsubcategoria_id = %s,
+                tier = %s, peso_drop = %s, file_id = %s, media_type = %s
             WHERE id = %s
-        """, (d["nome"], d["cat_id"], d["sub_id"], d["tier"], peso, d["file_id"], d["media_type"], d["id"]))
+        """, (d["nome"], d["cat_id"], d["sub_id"], d.get("subsub_id"), d["tier"], peso, d["file_id"], d["media_type"], d["id"]))
         conn.commit()
         cur.close()
         conn.close()
@@ -2602,8 +3004,9 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Salvo!")
         t_cfg = TIERS_CONFIG[d["tier"]]
         t_em = obter_emoji_tier(d["tier"])
-        cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
-        local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
+        cat_codigo, local_str = formatar_local_carta(
+            d["cat_id"], d["cat_nome"], d["sub_id"], d["sub_nome"], d.get("subsub_id"), d.get("subsub_nome")
+        )
         await query.edit_message_text(
             f"✅ <b>Carta #{d['id']} atualizada!</b>\n\n"
             f"{t_em} <b>{d['id']}. {esc(d['nome'])}.</b> <i>[{t_cfg['curto']}]</i>\n"
@@ -2768,6 +3171,8 @@ async def ed_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     d["sub_id"] = None
     d["sub_nome"] = None
+    d["subsub_id"] = None
+    d["subsub_nome"] = None
     texto, markup = _montar_menu_edicao(d)
     await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
     return ED_MENU
@@ -2820,6 +3225,8 @@ async def ed_decidir_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data["ed_carta"]
     d["sub_id"] = None
     d["sub_nome"] = None
+    d["subsub_id"] = None
+    d["subsub_nome"] = None
     texto, markup = _montar_menu_edicao(d)
     await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
     return ED_MENU
@@ -2840,6 +3247,8 @@ async def ed_escolher_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "ed_sem_sub":
         d["sub_id"] = None
         d["sub_nome"] = None
+        d["subsub_id"] = None
+        d["subsub_nome"] = None
         texto, markup = _montar_menu_edicao(d)
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
         return ED_MENU
@@ -2849,14 +3258,32 @@ async def ed_escolher_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
     sub_nome = cur.fetchone()[0]
+    cur.execute("SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s ORDER BY id ASC", (sub_id,))
+    subsubs = cur.fetchall()
     cur.close()
     conn.close()
 
     d["sub_id"] = sub_id
     d["sub_nome"] = sub_nome
-    texto, markup = _montar_menu_edicao(d)
-    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
-    return ED_MENU
+
+    botoes = []
+    linha = []
+    for ssid, ssnome in subsubs:
+        linha.append(InlineKeyboardButton(ssnome, callback_data=f"ed_subsub|{ssid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    botoes.append([InlineKeyboardButton("➕ Criar sub-subcategoria (grupo)", callback_data="ed_new_subsub")])
+    botoes.append([InlineKeyboardButton("➖ Sem sub-subcategoria", callback_data="ed_sem_subsub")])
+
+    await query.edit_message_text(
+        f"📂 Subcategoria: <b>{esc(sub_nome)}</b>\nEscolha a <b>sub-subcategoria (grupo)</b> ou deixe sem:",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
+    )
+    return ED_SUBSUB
 
 async def ed_receber_nova_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != context.user_data.get("admin_id"):
@@ -2888,6 +3315,102 @@ async def ed_receber_nova_sub(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     d["sub_id"] = sub_id
     d["sub_nome"] = sub_oficial
+    d["subsub_id"] = None
+    d["subsub_nome"] = None
+
+    botoes = [
+        [InlineKeyboardButton("➕ Criar sub-subcategoria (grupo)", callback_data="ed_subsub_sim")],
+        [InlineKeyboardButton("➡️ Sem sub-subcategoria", callback_data="ed_subsub_nao")],
+    ]
+    await update.message.reply_text(
+        f"✅ Subcategoria <b>{esc(sub_oficial)}</b> selecionada. Vai ter sub-subcategoria (grupo)?",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
+    )
+    return ED_ASK_SUBSUB
+
+async def ed_decidir_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_ASK_SUBSUB
+
+    await query.answer()
+    if query.data == "ed_subsub_sim":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova sub-subcategoria (grupo)</b>:", parse_mode="HTML")
+        return ED_NEW_SUBSUB
+
+    d = context.user_data["ed_carta"]
+    d["subsub_id"] = None
+    d["subsub_nome"] = None
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_escolher_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_SUBSUB
+
+    d = context.user_data["ed_carta"]
+    await query.answer()
+
+    if query.data == "ed_new_subsub":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova sub-subcategoria (grupo)</b>:", parse_mode="HTML")
+        return ED_NEW_SUBSUB
+
+    if query.data == "ed_sem_subsub":
+        d["subsub_id"] = None
+        d["subsub_nome"] = None
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    subsub_id = int(query.data.split("|")[1])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM subsubcategorias WHERE id = %s", (subsub_id,))
+    subsub_nome = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+
+    d["subsub_id"] = subsub_id
+    d["subsub_nome"] = subsub_nome
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_receber_nova_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_NEW_SUBSUB
+
+    subsub_nome = update.message.text.strip()
+    d = context.user_data["ed_carta"]
+    sub_id = d["sub_id"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s AND LOWER(nome) = LOWER(%s)",
+        (sub_id, subsub_nome)
+    )
+    existente = cur.fetchone()
+    if existente:
+        subsub_id, subsub_oficial = existente
+    else:
+        cur.execute(
+            "INSERT INTO subsubcategorias (subcategoria_id, nome) VALUES (%s, %s) RETURNING id",
+            (sub_id, subsub_nome)
+        )
+        subsub_id = cur.fetchone()[0]
+        subsub_oficial = subsub_nome
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    d["subsub_id"] = subsub_id
+    d["subsub_nome"] = subsub_oficial
     texto, markup = _montar_menu_edicao(d)
     await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return ED_MENU
@@ -2957,7 +3480,7 @@ async def ed_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
-# GERENCIADOR INTERATIVO DE CATEGORIAS (/categorias)
+# GERENCIADOR INTERATIVO DE CATEGORIAS (/categorias — 3 NÍVEIS)
 # ==========================================
 def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
     conn = get_db()
@@ -2973,7 +3496,7 @@ def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
     cur.close()
     conn.close()
 
-    linhas = ["📂 <b>Gerenciar Categorias & Subcategorias</b>\n"]
+    linhas = ["📂 <b>Gerenciar Categorias, Subcategorias & Grupos</b>\n"]
     botoes = []
     linha = []
     for cid, cnome, qtd_subs, qtd_cartas in cats:
@@ -2987,7 +3510,7 @@ def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
 
     botoes.append([InlineKeyboardButton("➕ Criar Nova Categoria", callback_data="catmgr|new_cat")])
     botoes.append([InlineKeyboardButton("❌ Fechar", callback_data="catmgr|close")])
-    linhas.append("\nToque em uma categoria para editar ou criar subcategorias:")
+    linhas.append("\nToque em uma categoria para editar ou gerenciar subcategorias/grupos:")
     return "\n".join(linhas), InlineKeyboardMarkup(botoes)
 
 def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
@@ -3005,7 +3528,9 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
     total_cartas = cur.fetchone()[0]
 
     cur.execute("""
-        SELECT s.id, s.nome, (SELECT COUNT(*) FROM cartas ct WHERE ct.subcategoria_id = s.id)
+        SELECT s.id, s.nome,
+               (SELECT COUNT(*) FROM subsubcategorias ss WHERE ss.subcategoria_id = s.id),
+               (SELECT COUNT(*) FROM cartas ct WHERE ct.subcategoria_id = s.id)
         FROM subcategorias s
         WHERE s.categoria_id = %s
         ORDER BY s.id ASC
@@ -3028,8 +3553,9 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
     if subs:
         linhas.append("<b>Subcategorias:</b>")
         linha = []
-        for sid, snome, scartas in subs:
-            linhas.append(f"   ↳ <code>[{sid}]</code> {esc(snome)} ({scartas} cartas)")
+        for sid, snome, q_grupos, scartas in subs:
+            extra_g = f" • {q_grupos} grupos" if q_grupos > 0 else ""
+            linhas.append(f"   ↳ <code>[{sid}]</code> {esc(snome)} ({scartas} cartas{extra_g})")
             linha.append(InlineKeyboardButton(f"📑 {snome}", callback_data=f"catmgr|sub|{sid}"))
             if len(linha) == 2:
                 botoes.append(linha)
@@ -3056,24 +3582,86 @@ def _montar_view_subcategoria(sub_id: int) -> tuple[str, InlineKeyboardMarkup] |
         WHERE s.id = %s
     """, (sub_id,))
     row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return None
+
+    _, sub_nome, cat_id, cat_nome, qtd_cartas = row
+
+    cur.execute("""
+        SELECT ss.id, ss.nome, (SELECT COUNT(*) FROM cartas ct WHERE ct.subsubcategoria_id = ss.id)
+        FROM subsubcategorias ss
+        WHERE ss.subcategoria_id = %s
+        ORDER BY ss.id ASC
+    """, (sub_id,))
+    subsubs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    linhas = [
+        f"📑 <b>Subcategoria #{sub_id}: {esc(sub_nome)}</b>",
+        f"📂 Categoria pai: <b>{esc(cat_nome)}</b>",
+        f"💿 Cartas vinculadas: <b>{qtd_cartas}</b>\n",
+    ]
+
+    botoes = [
+        [
+            InlineKeyboardButton("✏️ Renomear Subcategoria", callback_data="catmgr|ren_sub"),
+            InlineKeyboardButton("➕ Novo Grupo (Sub-sub)", callback_data="catmgr|new_subsub"),
+        ]
+    ]
+
+    if subsubs:
+        linhas.append("<b>Sub-subcategorias (Grupos):</b>")
+        linha = []
+        for ssid, ssnome, sscartas in subsubs:
+            linhas.append(f"   ↳ <code>[{ssid}]</code> {esc(ssnome)} ({sscartas} cartas)")
+            linha.append(InlineKeyboardButton(f"🏷️ {ssnome}", callback_data=f"catmgr|subsub|{ssid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+    else:
+        linhas.append("<i>Nenhuma sub-subcategoria (grupo) cadastrada.</i>")
+
+    botoes.append([
+        InlineKeyboardButton("🗑️ Excluir Subcategoria", callback_data="catmgr|del_sub"),
+        InlineKeyboardButton("⬅️ Voltar", callback_data=f"catmgr|cat|{cat_id}"),
+    ])
+    return "\n".join(linhas), InlineKeyboardMarkup(botoes)
+
+def _montar_view_subsubcategoria(subsub_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT ss.id, ss.nome, ss.subcategoria_id, s.nome, c.nome,
+               (SELECT COUNT(*) FROM cartas ct WHERE ct.subsubcategoria_id = ss.id)
+        FROM subsubcategorias ss
+        JOIN subcategorias s ON ss.subcategoria_id = s.id
+        JOIN categorias c ON s.categoria_id = c.id
+        WHERE ss.id = %s
+    """, (subsub_id,))
+    row = cur.fetchone()
     cur.close()
     conn.close()
     if not row:
         return None
 
-    _, sub_nome, cat_id, cat_nome, qtd_cartas = row
+    _, subsub_nome, sub_id, sub_nome, cat_nome, qtd_cartas = row
     texto = (
-        f"📑 <b>Subcategoria #{sub_id}: {esc(sub_nome)}</b>\n"
-        f"📂 Categoria pai: <b>{esc(cat_nome)}</b>\n"
+        f"🏷️ <b>Grupo / Sub-subcategoria #{subsub_id}: {esc(subsub_nome)}</b>\n"
+        f"📂 Caminho: <b>{esc(cat_nome)} • {esc(sub_nome)}</b>\n"
         f"💿 Cartas vinculadas: <b>{qtd_cartas}</b>"
     )
     botoes = [
         [
-            InlineKeyboardButton("✏️ Renomear Subcategoria", callback_data="catmgr|ren_sub"),
-            InlineKeyboardButton("🗑️ Excluir Subcategoria", callback_data="catmgr|del_sub"),
+            InlineKeyboardButton("✏️ Renomear Grupo", callback_data="catmgr|ren_subsub"),
+            InlineKeyboardButton("🗑️ Excluir Grupo", callback_data="catmgr|del_subsub"),
         ],
         [
-            InlineKeyboardButton("⬅️ Voltar", callback_data=f"catmgr|cat|{cat_id}"),
+            InlineKeyboardButton("⬅️ Voltar", callback_data=f"catmgr|sub|{sub_id}"),
         ],
     ]
     return texto, InlineKeyboardMarkup(botoes)
@@ -3176,6 +3764,11 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✏️ Digite o <b>novo nome</b> para esta subcategoria:", parse_mode="HTML")
         return CM_REN_SUB
 
+    if acao == "new_subsub":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>nome do novo grupo / sub-subcategoria</b>:", parse_mode="HTML")
+        return CM_NEW_SUBSUB
+
     if acao == "del_sub":
         sub_id = context.user_data.get("cm_sub_id")
         cat_id = context.user_data.get("cm_cat_id")
@@ -3196,6 +3789,43 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = _montar_view_categoria(cat_id)
         await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
         return CM_CAT_VIEW
+
+    if acao == "subsub":
+        subsub_id = int(partes[2])
+        res = _montar_view_subsubcategoria(subsub_id)
+        if not res:
+            await query.answer("Grupo não encontrado.", show_alert=True)
+            return CM_SUB_VIEW
+        await query.answer()
+        context.user_data["cm_subsub_id"] = subsub_id
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_SUBSUB_VIEW
+
+    if acao == "ren_subsub":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>novo nome</b> para este grupo / sub-subcategoria:", parse_mode="HTML")
+        return CM_REN_SUBSUB
+
+    if acao == "del_subsub":
+        subsub_id = context.user_data.get("cm_subsub_id")
+        sub_id = context.user_data.get("cm_sub_id")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cartas WHERE subsubcategoria_id = %s", (subsub_id,))
+        qtd = cur.fetchone()[0]
+        if qtd > 0:
+            cur.close()
+            conn.close()
+            await query.answer(f"Não é possível excluir: existem {qtd} cartas nesse grupo!", show_alert=True)
+            return CM_SUBSUB_VIEW
+        cur.execute("DELETE FROM subsubcategorias WHERE id = %s", (subsub_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Grupo excluído!")
+        res = _montar_view_subcategoria(sub_id)
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_SUB_VIEW
 
     return CM_HOME
 
@@ -3315,6 +3945,67 @@ async def catmgr_receber_ren_sub(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
     return CM_SUB_VIEW
 
+async def catmgr_receber_nova_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_NEW_SUBSUB
+
+    nome = update.message.text.strip()
+    sub_id = context.user_data.get("cm_sub_id")
+    if not nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_NEW_SUBSUB
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM subsubcategorias WHERE subcategoria_id = %s AND LOWER(nome) = LOWER(%s)",
+        (sub_id, nome)
+    )
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO subsubcategorias (subcategoria_id, nome) VALUES (%s, %s)",
+            (sub_id, nome)
+        )
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    res = _montar_view_subcategoria(sub_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_SUB_VIEW
+
+async def catmgr_receber_ren_subsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_REN_SUBSUB
+
+    novo_nome = update.message.text.strip()
+    subsub_id = context.user_data.get("cm_subsub_id")
+    sub_id = context.user_data.get("cm_sub_id")
+    if not novo_nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_REN_SUBSUB
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM subsubcategorias WHERE subcategoria_id = %s AND LOWER(nome) = LOWER(%s) AND id != %s",
+        (sub_id, novo_nome, subsub_id)
+    )
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        await update.message.reply_text("⚠️ Já existe outro grupo com esse nome nessa subcategoria. Digite outro:")
+        return CM_REN_SUBSUB
+
+    cur.execute("UPDATE subsubcategorias SET nome = %s WHERE id = %s", (novo_nome, subsub_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    res = _montar_view_subsubcategoria(subsub_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_SUBSUB_VIEW
+
 async def catmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer("Fechado.")
@@ -3341,21 +4032,22 @@ def _montar_home_textos() -> tuple[str, InlineKeyboardMarkup]:
     botoes = [
         [
             InlineKeyboardButton("🚀 Texto do /start", callback_data="txmgr|item|start_texto"),
+            InlineKeyboardButton("📜 Texto /comandos", callback_data="txmgr|item|comandos_texto"),
+        ],
+        [
             InlineKeyboardButton("🎞️ GIF / Foto do /start", callback_data="txmgr|start_media"),
-        ],
-        [
             InlineKeyboardButton("🎰 Menu /girar", callback_data="txmgr|item|menu_girar"),
+        ],
+        [
             InlineKeyboardButton("🌐 Resultado Giro (1x)", callback_data="txmgr|item|giro_resultado"),
-        ],
-        [
             InlineKeyboardButton("🔥 Cabeçalho Multi-Giro", callback_data="txmgr|item|giro_multi"),
+        ],
+        [
             InlineKeyboardButton("⬇️ Rodapé pós-Giro", callback_data="txmgr|item|giro_rodape"),
-        ],
-        [
             InlineKeyboardButton("⏳ Msg Sem Giros", callback_data="txmgr|item|sem_giros"),
-            InlineKeyboardButton("🎨 Emojis dos Tiers", callback_data="txmgr|tiers"),
         ],
         [
+            InlineKeyboardButton("🎨 Emojis dos Tiers", callback_data="txmgr|tiers"),
             InlineKeyboardButton("❌ Fechar", callback_data="txmgr|close"),
         ],
     ]
@@ -3584,18 +4276,18 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = (
         "🎛️ <b>Ecco-Mix Studio (Painel Admin)</b>\n\n"
         "<b>Criar & Gerenciar Cartas:</b>\n"
-        f"• /addcarta — Assistente interativo com botões (Categoria → Subcategoria → Nome → Foto {LARGURA_CARTA}×{ALTURA_CARTA} → Tier)\n"
+        f"• /addcarta — Assistente interativo com botões (Categoria → Subcategoria → Grupo → Nome → Foto {LARGURA_CARTA}×{ALTURA_CARTA} → Tier)\n"
         "• /editcarta (ou <code>/editcarta ID</code>) — Assistente com botões e paginação para editar cartas\n"
-        "• /catalogo — Listar cartas por categoria/subcategoria com paginação\n"
+        "• /catalogo — Listar cartas por categoria/subcategoria/grupo com paginação\n"
         "• /delcarta <code>ID</code> — Excluir uma carta\n\n"
         "<b>Textos Públicos, GIF do /start & Emojis Premium:</b>\n"
-        "• /textos — Editar textos públicos, GIF do <code>/start</code> e emojis Premium dos Tiers\n\n"
+        "• /textos — Editar textos públicos, <code>/comandos</code>, GIF do <code>/start</code> e emojis Premium dos Tiers\n\n"
         "<b>Molduras PNG por Tier (Opcional):</b>\n"
         "• /moldura <code>1 a 5</code> — Responda a um arquivo <b>.PNG transparente</b> para definir a moldura daquele Tier\n"
         "• /molduras — Ver quais Tiers têm moldura ativa\n"
         "• /remmoldura <code>1 a 5</code> — Remover moldura de um Tier\n\n"
-        "<b>Categorias & Subcategorias:</b>\n"
-        "• /categorias — Gerenciar categorias e subcategorias por botões (criar, renomear, excluir)\n"
+        "<b>Categorias, Subcategorias & Grupos:</b>\n"
+        "• /categorias — Gerenciar categorias, subcategorias e grupos (sub-subcategorias) por botões\n"
         "• /listacat — Ver lista rápida de IDs e nomes\n"
         "• /editcat <code>ID | NovoNome</code> — Atalho para renomear categoria\n"
         "• /editsub <code>ID | NovoNome</code> — Atalho para renomear subcategoria\n\n"
@@ -3610,7 +4302,7 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🛠️ Editar Carta", callback_data="studio_go|editcarta"),
         ],
         [
-            InlineKeyboardButton("📂 Categorias & Subs", callback_data="studio_go|categorias"),
+            InlineKeyboardButton("📂 Categorias & Grupos", callback_data="studio_go|categorias"),
             InlineKeyboardButton("📝 Textos & /start", callback_data="studio_go|textos"),
         ],
         [
@@ -3709,20 +4401,29 @@ async def cmd_lista_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cats = cur.fetchall()
     cur.execute("SELECT id, categoria_id, nome FROM subcategorias ORDER BY id ASC")
     subs = cur.fetchall()
+    cur.execute("SELECT id, subcategoria_id, nome FROM subsubcategorias ORDER BY id ASC")
+    subsubs = cur.fetchall()
     cur.close()
     conn.close()
 
+    mapa_subsubs = {}
+    for ssid, sid, ssnome in subsubs:
+        mapa_subsubs.setdefault(sid, []).append(f"<code>[{ssid}]</code> {esc(ssnome)}")
+
     mapa_subs = {}
     for sid, cid, snome in subs:
-        mapa_subs.setdefault(cid, []).append(f"<code>[{sid}]</code> {esc(snome)}")
+        item = f"<code>[{sid}]</code> {esc(snome)}"
+        if sid in mapa_subsubs:
+            item += f" ({', '.join(mapa_subsubs[sid])})"
+        mapa_subs.setdefault(cid, []).append(item)
 
-    linhas = ["📂 <b>Categorias e Subcategorias</b>\n"]
+    linhas = ["📂 <b>Categorias, Subcategorias & Grupos</b>\n"]
     for cid, cnome in cats:
         linhas.append(f"• <code>[{cid}]</code> <b>{esc(cnome)}</b>")
         if cid in mapa_subs:
             linhas.append(f"   ↳ {', '.join(mapa_subs[cid])}")
 
-    await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+    await update.message.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
 
 async def cmd_edit_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
@@ -3799,18 +4500,19 @@ async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply = msg.reply_to_message
-    # Ignora o reply automático que o Telegram cria em grupos com Tópicos (Fóruns)
-    eh_reply_real = (
-        reply is not None
-        and getattr(reply, "forum_topic_created", None) is None
-        and getattr(reply, "forum_topic_edited", None) is None
-        and getattr(reply, "general_forum_topic_hidden", None) is None
-        and getattr(reply, "general_forum_topic_unhidden", None) is None
-        and (
-            not getattr(msg, "is_topic_message", False)
-            or reply.message_id != getattr(msg, "message_thread_id", None)
+    # Ignora apenas o reply automático de cabeçalho de tópico em grupos com Fóruns
+    eh_servico_topico = reply is not None and any(
+        getattr(reply, attr, None) is not None
+        for attr in (
+            "forum_topic_created",
+            "forum_topic_edited",
+            "forum_topic_closed",
+            "forum_topic_reopened",
+            "general_forum_topic_hidden",
+            "general_forum_topic_unhidden",
         )
     )
+    eh_reply_real = reply is not None and not eh_servico_topico
 
     alvo_id = None
     alvo_username = ""
@@ -3897,6 +4599,7 @@ async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Total disponível agora: <b>{novo_total}</b>",
         parse_mode="HTML",
     )
+
 async def cmd_add_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
         return
@@ -3951,7 +4654,7 @@ async def main():
         .build()
     )
 
-    # Assistente interativo /addcarta
+    # Assistente interativo /addcarta (com 3 níveis)
     conv_carta = ConversationHandler(
         entry_points=[
             CommandHandler("addcarta", wiz_start),
@@ -3963,7 +4666,10 @@ async def main():
             ST_ASK_SUB_CHOICE: [CallbackQueryHandler(wiz_decidir_sub, pattern=r"^wiz_sub_(sim|nao)$")],
             ST_SUB: [CallbackQueryHandler(wiz_escolher_sub, pattern=r"^wiz_(sub\|.+|new_sub)$")],
             ST_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_receber_nova_sub)],
-            ST_NOME: [CallbackQueryHandler(wiz_escolher_nome, pattern=r"^wiz_(nome\|.+|new_nome)$")],
+            ST_ASK_SUBSUB_CHOICE: [CallbackQueryHandler(wiz_decidir_subsub, pattern=r"^wiz_subsub_(sim|nao)$")],
+            ST_SUBSUB: [CallbackQueryHandler(wiz_escolher_subsub, pattern=r"^wiz_(subsub\|.+|new_subsub|no_subsub)$")],
+            ST_NEW_SUBSUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_receber_nova_subsub)],
+            ST_NOME: [CallbackQueryHandler(wiz_escolher_nome, pattern=r"^wiz_(nome\|.+|new_nome|new_subsub_from_nome)$")],
             ST_NEW_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_receber_novo_nome)],
             ST_MIDIA: [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.ANIMATION, wiz_receber_midia)],
             ST_TIER: [CallbackQueryHandler(wiz_escolher_tier, pattern=r"^wiz_tier")],
@@ -3978,7 +4684,7 @@ async def main():
     )
     app.add_handler(conv_carta)
 
-    # Assistente interativo /editcarta (com paginação)
+    # Assistente interativo /editcarta (com paginação & 3 níveis)
     conv_edit_carta = ConversationHandler(
         entry_points=[
             CommandHandler("editcarta", ed_start),
@@ -3995,6 +4701,9 @@ async def main():
             ED_ASK_SUB: [CallbackQueryHandler(ed_decidir_sub, pattern=r"^ed_sub_(sim|nao)$")],
             ED_SUB: [CallbackQueryHandler(ed_escolher_sub, pattern=r"^ed_(sub\||new_sub$|sem_sub$)")],
             ED_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nova_sub)],
+            ED_ASK_SUBSUB: [CallbackQueryHandler(ed_decidir_subsub, pattern=r"^ed_subsub_(sim|nao)$")],
+            ED_SUBSUB: [CallbackQueryHandler(ed_escolher_subsub, pattern=r"^ed_(subsub\||new_subsub$|sem_subsub$)")],
+            ED_NEW_SUBSUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nova_subsub)],
             ED_MIDIA: [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.ANIMATION, ed_receber_midia)],
             ED_TIER: [CallbackQueryHandler(ed_escolher_tier, pattern=r"^ed_(tier\||tlock\||voltar$)")],
         },
@@ -4008,7 +4717,7 @@ async def main():
     )
     app.add_handler(conv_edit_carta)
 
-    # Gerenciador interativo /categorias
+    # Gerenciador interativo /categorias (com 3 níveis)
     conv_catmgr = ConversationHandler(
         entry_points=[
             CommandHandler("categorias", catmgr_start),
@@ -4019,9 +4728,12 @@ async def main():
             CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|new_sub$|del_cat$|sub\||home$|close$)")],
             CM_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_cat)],
             CM_REN_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_cat)],
-            CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|del_sub$|cat\||home$|close$)")],
+            CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|new_subsub$|del_sub$|subsub\||cat\||home$|close$)")],
             CM_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_sub)],
             CM_REN_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_sub)],
+            CM_SUBSUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_subsub$|del_subsub$|sub\||home$|close$)")],
+            CM_NEW_SUBSUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_subsub)],
+            CM_REN_SUBSUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_subsub)],
         },
         fallbacks=[
             CommandHandler("cancelar", catmgr_cancel),
@@ -4062,6 +4774,7 @@ async def main():
 
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
+    app.add_handler(CommandHandler(["comandos", "comados"], cmd_comandos))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
     app.add_handler(CommandHandler("meuid", cmd_meu_id))
     app.add_handler(CommandHandler("girar", cmd_girar))
@@ -4088,6 +4801,7 @@ async def main():
     # Botões Interativos do Jogo
     app.add_handler(CallbackQueryHandler(callback_girar_categoria, pattern=r"^rcat\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_subcategoria, pattern=r"^rsub\|"))
+    app.add_handler(CallbackQueryHandler(callback_girar_subsubcategoria, pattern=r"^rsubsub\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_quantidade, pattern=r"^rqtd\|"))
     app.add_handler(CallbackQueryHandler(callback_ranking_cid, pattern=r"^rank_cid\|"))
     app.add_handler(CallbackQueryHandler(callback_catalogo, pattern=r"^catlist\|"))
@@ -4128,13 +4842,14 @@ async def main():
 
     await app.bot.set_my_commands([
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
+        BotCommand("apelido", "Definir seu apelido único no jogo"),
+        BotCommand("comandos", "Ver todos os comandos disponíveis"),
         BotCommand("colecao", "Ver toda a sua coleção"),
         BotCommand("catalogo", "Listar cartas por categoria"),
         BotCommand("artista", "Ver progresso dos 5 tiers de um artista"),
         BotCommand("ranking", "Ver ranking de jogadores de um artista"),
         BotCommand("carta", "Visualizar uma carta pelo ID"),
         BotCommand("trocar", "Propor troca de cartas"),
-        BotCommand("apelido", "Definir seu apelido único no jogo"),
         BotCommand("meuid", "Ver seu ID numérico"),
     ])
 
