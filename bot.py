@@ -2,9 +2,12 @@ import io
 import os
 import re
 import html
+import time
 import random
 import asyncio
+from collections import Counter
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool, PoolError
 from datetime import date
 from aiohttp import web
 from PIL import Image, ImageOps
@@ -40,6 +43,11 @@ CAT_PAGE_SIZE = 15
 
 # Trava em memória para evitar clique duplo simultâneo no giro
 GIROS_EM_ANDAMENTO: set[int] = set()
+
+# Pool de conexões e cache em memória para textos/emojis
+DB_POOL: ThreadedConnectionPool | None = None
+_CONFIG_CACHE: dict[str, str] = {}
+_CONFIG_LOADED = False
 
 TIERS_CONFIG = {
     1: {"nome": "Tier 1 (Comum)", "curto": "Tier 1", "emoji": "🌱", "peso": 48},
@@ -227,10 +235,100 @@ def extrair_html_com_custom_emojis(message) -> str:
     return "".join(partes)
 
 # ==========================================
-# BANCO DE DADOS E INICIALIZAÇÃO
+# POOL DE CONEXÕES & BANCO DE DADOS
 # ==========================================
+class _PooledConn:
+    """Wrapper transparente que devolve a conexão ao pool ao chamar .close()."""
+    def __init__(self, pool: ThreadedConnectionPool | None, conn, pooled: bool = True):
+        self._pool = pool
+        self._conn = conn
+        self._pooled = pooled
+        self._returned = False
+
+    def cursor(self, *args, **kwargs):
+        return self._conn.cursor(*args, **kwargs)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        if self._returned:
+            return
+        self._returned = True
+        if not self._pooled or self._pool is None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            return
+        try:
+            if self._conn.closed != 0:
+                self._pool.putconn(self._conn, close=True)
+            else:
+                self._conn.rollback()
+                self._pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._pool.putconn(self._conn, close=True)
+            except Exception:
+                pass
+
+def init_pool():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=12,
+            dsn=DATABASE_URL,
+            connect_timeout=10,
+            options="-c statement_timeout=15000",
+        )
+
 def get_db():
-    return psycopg2.connect(DATABASE_URL)
+    init_pool()
+    for _ in range(3):
+        try:
+            conn = DB_POOL.getconn()
+        except PoolError:
+            time.sleep(0.15)
+            continue
+
+        try:
+            if conn.closed != 0:
+                DB_POOL.putconn(conn, close=True)
+                continue
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+            return _PooledConn(DB_POOL, conn, pooled=True)
+        except Exception:
+            try:
+                DB_POOL.putconn(conn, close=True)
+            except Exception:
+                pass
+
+    raw = psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        options="-c statement_timeout=15000",
+    )
+    return _PooledConn(None, raw, pooled=False)
+
+def carregar_cache_config():
+    global _CONFIG_LOADED
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT chave, valor FROM config_textos")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    _CONFIG_CACHE.clear()
+    for k, v in rows:
+        _CONFIG_CACHE[k] = v
+    _CONFIG_LOADED = True
 
 def iniciar_banco():
     conn = get_db()
@@ -265,10 +363,6 @@ def iniciar_banco():
             giros_restantes INTEGER DEFAULT 10,
             ultimo_reset TEXT
         );
-        ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS apelido TEXT;
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_apelido_unico
-            ON usuarios (LOWER(TRIM(apelido)))
-            WHERE apelido IS NOT NULL AND TRIM(apelido) <> '';
         CREATE TABLE IF NOT EXISTS cartas (
             id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
@@ -295,6 +389,28 @@ def iniciar_banco():
         );
     """)
 
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'usuarios' AND column_name = 'apelido'
+    """)
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE usuarios ADD COLUMN apelido TEXT;")
+
+    cur.execute("""
+        SELECT 1 FROM pg_indexes
+        WHERE tablename = 'usuarios' AND indexname = 'idx_usuarios_apelido_unico'
+    """)
+    if not cur.fetchone():
+        cur.execute("""
+            CREATE UNIQUE INDEX idx_usuarios_apelido_unico
+                ON usuarios (LOWER(TRIM(apelido)))
+                WHERE apelido IS NOT NULL AND TRIM(apelido) <> '';
+        """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_inventario_user_carta ON inventario (user_id, carta_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cartas_cat_sub ON cartas (categoria_id, subcategoria_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cartas_lower_nome ON cartas (LOWER(nome));")
+
     cur.execute("SELECT COUNT(*) FROM categorias")
     if cur.fetchone()[0] == 0:
         for cat_nome, subs in CATALOGO_INICIAL.items():
@@ -309,17 +425,12 @@ def iniciar_banco():
     conn.commit()
     cur.close()
     conn.close()
+    carregar_cache_config()
 
 def obter_config_valor(chave: str, padrao: str = "") -> str:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT valor FROM config_textos WHERE chave = %s", (chave,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if row and row[0] is not None:
-        return row[0]
-    return padrao
+    if not _CONFIG_LOADED:
+        carregar_cache_config()
+    return _CONFIG_CACHE.get(chave, padrao)
 
 def salvar_config_valor(chave: str, valor: str):
     conn = get_db()
@@ -331,6 +442,7 @@ def salvar_config_valor(chave: str, valor: str):
     conn.commit()
     cur.close()
     conn.close()
+    _CONFIG_CACHE[chave] = valor
 
 def remover_config_valor(chave: str):
     conn = get_db()
@@ -339,6 +451,7 @@ def remover_config_valor(chave: str):
     conn.commit()
     cur.close()
     conn.close()
+    _CONFIG_CACHE.pop(chave, None)
 
 def obter_texto_publico(chave: str) -> str:
     return obter_config_valor(chave, TEXTOS_PADRAO.get(chave, ""))
@@ -363,7 +476,7 @@ def verificar_usuario(user_id: int, username: str = "") -> int:
     hoje = str(date.today())
     username_limpo = (username or "").lstrip("@").lower()
 
-    cur.execute("SELECT giros_restantes, ultimo_reset FROM usuarios WHERE user_id = %s", (user_id,))
+    cur.execute("SELECT giros_restantes, ultimo_reset, username FROM usuarios WHERE user_id = %s", (user_id,))
     row = cur.fetchone()
 
     if not row:
@@ -372,18 +485,23 @@ def verificar_usuario(user_id: int, username: str = "") -> int:
             (user_id, username_limpo, GIROS_DIARIOS, hoje)
         )
         giros = GIROS_DIARIOS
+        conn.commit()
     else:
-        giros, ultimo_reset = row
-        if username_limpo:
+        giros, ultimo_reset, uname_atual = row
+        precisa_update = False
+        if username_limpo and username_limpo != (uname_atual or ""):
             cur.execute("UPDATE usuarios SET username = %s WHERE user_id = %s", (username_limpo, user_id))
+            precisa_update = True
         if ultimo_reset != hoje:
             giros = GIROS_DIARIOS
             cur.execute(
                 "UPDATE usuarios SET giros_restantes = %s, ultimo_reset = %s WHERE user_id = %s",
                 (GIROS_DIARIOS, hoje, user_id)
             )
+            precisa_update = True
+        if precisa_update:
+            conn.commit()
 
-    conn.commit()
     cur.close()
     conn.close()
     return giros
@@ -600,7 +718,6 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(sem_giros_txt, parse_mode="HTML")
         return
 
-    # Suporte a /girar <qtd> ou /girar tudo
     qtd_preset = 0
     if context.args:
         arg0 = context.args[0].strip().lower()
@@ -961,109 +1078,99 @@ async def _processar_giros_core(
         if query:
             await query.answer()
 
-        if menu_message:
-            try:
-                await menu_message.edit_text(
-                    f"🎲 <i>Sintonizando {'mix' if qtd_efetiva == 1 else f'{qtd_efetiva} mixes'}...</i>",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
         pesos = [c[7] for c in cartas]
         sorteadas = random.choices(cartas, weights=pesos, k=qtd_efetiva)
 
         cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - %s WHERE user_id = %s", (qtd_efetiva, user.id))
 
-        resultados_lote = []
-        for c_tuple in sorteadas:
-            (
-                carta_id,
-                nome_carta,
-                cid_cat,
-                nome_cat,
-                cid_sub,
-                nome_sub,
-                tier,
-                _,
-                file_id,
-                media_type,
-            ) = c_tuple
+        # Agrupa as cartas sorteadas para atualizar o inventário em poucas queries
+        mapa_cartas = {c[0]: c for c in cartas}
+        contagem_sorteio = Counter(c[0] for c in sorteadas)
 
-            cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
-            item = cur.fetchone()
-            if item:
-                qtd_carta = item[1] + 1
-                eh_nova = False
-                cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (qtd_carta, item[0]))
+        cur.execute(
+            "SELECT id, carta_id, quantidade FROM inventario WHERE user_id = %s AND carta_id = ANY(%s)",
+            (user.id, list(contagem_sorteio.keys()))
+        )
+        inv_atual = {cid: (inv_id, qtd) for inv_id, cid, qtd in cur.fetchall()}
+
+        status_por_carta = {}
+        for cid, ganhas in contagem_sorteio.items():
+            if cid in inv_atual:
+                inv_id, qtd_antiga = inv_atual[cid]
+                nova_qtd = qtd_antiga + ganhas
+                cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (nova_qtd, inv_id))
+                status_por_carta[cid] = {"qtd_total": nova_qtd, "eh_nova": False}
             else:
-                qtd_carta = 1
-                eh_nova = True
-                cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
-
-            resultados_lote.append({
-                "carta_id": carta_id,
-                "nome": nome_carta,
-                "cid_cat": cid_cat,
-                "nome_cat": nome_cat,
-                "cid_sub": cid_sub,
-                "nome_sub": nome_sub,
-                "tier": tier,
-                "file_id": file_id,
-                "media_type": media_type,
-                "qtd_total": qtd_carta,
-                "eh_nova": eh_nova,
-            })
+                cur.execute(
+                    "INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, %s)",
+                    (user.id, cid, ganhas)
+                )
+                status_por_carta[cid] = {"qtd_total": ganhas, "eh_nova": True}
 
         giros_restantes = giros - qtd_efetiva
+        rodape_txt = renderizar_template(
+            obter_texto_publico("giro_rodape"),
+            apelido=esc(apelido_user),
+            qtd_giros=qtd_efetiva,
+            giros_restantes=giros_restantes,
+        )
 
         if qtd_efetiva == 1:
-            r = resultados_lote[0]
+            c_tuple = sorteadas[0]
+            carta_id, nome_carta, cid_cat, nome_cat, cid_sub, nome_sub, tier, _, file_id, media_type = c_tuple
+            st = status_por_carta[carta_id]
+
             cur.execute("""
                 SELECT COUNT(DISTINCT c.tier)
                 FROM inventario i
                 JOIN cartas c ON i.carta_id = c.id
                 WHERE i.user_id = %s AND LOWER(c.nome) = LOWER(%s)
-            """, (user.id, r["nome"]))
+            """, (user.id, nome_carta))
             tiers_obtidos = cur.fetchone()[0]
 
-            cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (r["nome"],))
+            cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_carta,))
             tiers_cadastrados = cur.fetchone()[0]
 
             conn.commit()
             cur.close()
             conn.close()
 
-            tier_info = TIERS_CONFIG[r["tier"]]
-            tier_emoji = obter_emoji_tier(r["tier"])
-            cat_codigo = r["cid_sub"] if r["cid_sub"] else r["cid_cat"]
-            local_str = f"{esc(r['nome_cat'])} • {esc(r['nome_sub'])}" if r["nome_sub"] else esc(r["nome_cat"])
+            tier_info = TIERS_CONFIG[tier]
+            tier_emoji = obter_emoji_tier(tier)
+            cat_codigo = cid_sub if cid_sub else cid_cat
+            local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
 
             legenda = renderizar_template(
                 obter_texto_publico("giro_resultado"),
                 apelido=esc(apelido_user),
-                carta_id=r["carta_id"],
-                nome=esc(r["nome"]),
+                carta_id=carta_id,
+                nome=esc(nome_carta),
                 tier_emoji=tier_emoji,
                 tier_curto=tier_info["curto"],
                 tier_nome=tier_info["nome"],
                 cat_codigo=cat_codigo,
                 local=local_str,
-                qtd=r["qtd_total"],
+                qtd=st["qtd_total"],
                 tiers_obtidos=tiers_obtidos,
                 tiers_cadastrados=tiers_cadastrados,
                 giros_restantes=giros_restantes,
             )
-            await enviar_midia_carta(reply_anchor, r["file_id"], r["media_type"], legenda, bot=bot)
+
+            legenda_completa = f"{legenda}\n\n{rodape_txt}"
+            if len(legenda_completa) <= 1024:
+                await enviar_midia_carta(reply_anchor, file_id, media_type, legenda_completa, bot=bot)
+            else:
+                await enviar_midia_carta(reply_anchor, file_id, media_type, legenda, bot=bot)
+                await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id, reply_to_message=reply_anchor)
         else:
             conn.commit()
             cur.close()
             conn.close()
 
-            # Destaque = carta de maior Tier sorteada no lote
-            destaque = max(resultados_lote, key=lambda x: x["tier"])
-            destaque_emoji = obter_emoji_tier(destaque["tier"])
-            destaque_info = TIERS_CONFIG[destaque["tier"]]
+            destaque_tuple = max(sorteadas, key=lambda x: x[6])
+            d_id, d_nome, _, _, _, _, d_tier, _, d_file, d_media = destaque_tuple
+            destaque_emoji = obter_emoji_tier(d_tier)
+            destaque_info = TIERS_CONFIG[d_tier]
 
             cabecalho = renderizar_template(
                 obter_texto_publico("giro_multi"),
@@ -1074,58 +1181,37 @@ async def _processar_giros_core(
 
             linhas = [
                 cabecalho,
-                f"\n🌟 <b>Destaque:</b> {destaque_emoji} <b>#{destaque['carta_id']} {esc(destaque['nome'])}</b> <i>[{destaque_info['curto']}]</i>\n",
+                f"\n🌟 <b>Destaque:</b> {destaque_emoji} <b>#{d_id} {esc(d_nome)}</b> <i>[{destaque_info['curto']}]</i>\n",
             ]
 
-            if qtd_efetiva <= 20:
-                for item in resultados_lote:
-                    em = obter_emoji_tier(item["tier"])
-                    t_c = TIERS_CONFIG[item["tier"]]["curto"]
-                    tag_nova = " 🆕" if item["eh_nova"] else f" (x{item['qtd_total']})"
-                    linhas.append(f"{em} <code>#{item['carta_id']}</code> <b>{esc(item['nome'])}</b> <i>[{t_c}]</i>{tag_nova}")
-            else:
-                agrupado = {}
-                for item in resultados_lote:
-                    key = item["carta_id"]
-                    if key not in agrupado:
-                        agrupado[key] = {**item, "vezes": 0, "teve_nova": False}
-                    agrupado[key]["vezes"] += 1
-                    if item["eh_nova"]:
-                        agrupado[key]["teve_nova"] = True
-                for item in agrupado.values():
-                    em = obter_emoji_tier(item["tier"])
-                    t_c = TIERS_CONFIG[item["tier"]]["curto"]
-                    tag_nova = " 🆕" if item["teve_nova"] else ""
-                    vezes_txt = f" <b>({item['vezes']}x)</b>" if item["vezes"] > 1 else ""
-                    linhas.append(f"{em} <code>#{item['carta_id']}</code> <b>{esc(item['nome'])}</b> <i>[{t_c}]</i>{vezes_txt}{tag_nova}")
+            for cid, vezes in contagem_sorteio.items():
+                _, c_nome, _, _, _, _, c_tier, _, _, _ = mapa_cartas[cid]
+                st = status_por_carta[cid]
+                em = obter_emoji_tier(c_tier)
+                t_c = TIERS_CONFIG[c_tier]["curto"]
+                tag_nova = " 🆕" if st["eh_nova"] else f" (total: {st['qtd_total']}x)"
+                vezes_txt = f" <b>+{vezes}x</b>" if vezes > 1 else ""
+                linhas.append(f"{em} <code>#{cid}</code> <b>{esc(c_nome)}</b> <i>[{t_c}]</i>{vezes_txt}{tag_nova}")
 
             legenda = "\n".join(linhas)
-            if len(legenda) <= 1024:
-                await enviar_midia_carta(reply_anchor, destaque["file_id"], destaque["media_type"], legenda, bot=bot)
+            legenda_completa = f"{legenda}\n\n{rodape_txt}"
+            if len(legenda_completa) <= 1024:
+                await enviar_midia_carta(reply_anchor, d_file, d_media, legenda_completa, bot=bot)
             else:
                 await enviar_midia_carta(
                     reply_anchor,
-                    destaque["file_id"],
-                    destaque["media_type"],
-                    f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{destaque['carta_id']} {esc(destaque['nome'])}</b> <i>[{destaque_info['curto']}]</i>",
+                    d_file,
+                    d_media,
+                    f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{d_id} {esc(d_nome)}</b> <i>[{destaque_info['curto']}]</i>",
                     bot=bot,
                 )
-                await enviar_texto_seguro(chat_id, legenda[:4000], bot, thread_id=thread_id, reply_to_message=reply_anchor)
+                await enviar_texto_seguro(chat_id, legenda_completa[:4000], bot, thread_id=thread_id, reply_to_message=reply_anchor)
 
-        # Apaga o menu de botões de cima e envia o rodapé EMBAIXO do resultado do giro
         if menu_message:
             try:
                 await menu_message.delete()
             except Exception:
                 pass
-
-        rodape_txt = renderizar_template(
-            obter_texto_publico("giro_rodape"),
-            apelido=esc(apelido_user),
-            qtd_giros=qtd_efetiva,
-            giros_restantes=giros_restantes,
-        )
-        await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id, reply_to_message=reply_anchor)
     finally:
         GIROS_EM_ANDAMENTO.discard(user.id)
 
@@ -2239,7 +2325,7 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(raw_file_id)
         buf_in = io.BytesIO()
         await tg_file.download_to_memory(buf_in)
-        buf_out = processar_imagem_carta(buf_in.getvalue(), tier)
+        buf_out = await asyncio.to_thread(processar_imagem_carta, buf_in.getvalue(), tier)
 
         sent_msg = await query.message.reply_photo(
             photo=buf_out,
@@ -2815,7 +2901,7 @@ async def ed_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(raw_id)
         buf_in = io.BytesIO()
         await tg_file.download_to_memory(buf_in)
-        buf_out = processar_imagem_carta(buf_in.getvalue(), d["tier"])
+        buf_out = await asyncio.to_thread(processar_imagem_carta, buf_in.getvalue(), d["tier"])
         sent_msg = await msg.reply_photo(
             photo=buf_out,
             caption=f"🖼️ <i>Nova mídia ({LARGURA_CARTA}×{ALTURA_CARTA})</i>",
@@ -3423,7 +3509,6 @@ async def txmgr_receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE
         return TX_EDIT_VAL
 
     try:
-        # Testa renderização HTML enviando uma prévia
         salvar_config_valor(chave, novo_html)
         texto, markup = _montar_view_texto(chave)
         await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
@@ -3772,10 +3857,11 @@ async def cmd_rem_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # INICIALIZAÇÃO DO SERVIDOR (RENDER + NEON)
 # ==========================================
 async def main():
-    iniciar_banco()
+    print("🚀 [1/4] Iniciando servidor HTTP...", flush=True)
     app = (
         Application.builder()
         .token(TOKEN)
+        .concurrent_updates(True)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
@@ -3929,9 +4015,12 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_custom_spin_texto), group=1)
 
     async def handle_webhook(request):
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.update_queue.put(update)
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.update_queue.put(update)
+        except Exception as e:
+            print(f"⚠️ Erro ao processar update no webhook: {e}", flush=True)
         return web.Response(text="OK")
 
     async def handle_health(request):
@@ -3945,11 +4034,15 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+    print(f"✅ [2/4] Porta {PORT} aberta com sucesso!", flush=True)
+
+    print("🗄️ [3/4] Conectando e verificando banco de dados...", flush=True)
+    await asyncio.to_thread(iniciar_banco)
+    print("✅ [3/4] Banco de dados pronto!", flush=True)
 
     await app.initialize()
     await app.start()
 
-    # Registra comandos no menu "/" do Telegram (essencial para grupos)
     await app.bot.set_my_commands([
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
         BotCommand("colecao", "Ver toda a sua coleção"),
@@ -3963,6 +4056,7 @@ async def main():
     ])
 
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
+    print(f"✅ [4/4] Bot online e webhook configurado em {WEBHOOK_URL}/webhook", flush=True)
 
     await asyncio.Event().wait()
 
