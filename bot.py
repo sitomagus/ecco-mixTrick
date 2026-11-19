@@ -32,8 +32,8 @@ if env_admins:
     SUPER_ADMINS.extend([int(x.strip()) for x in env_admins.split(",") if x.strip().isdigit()])
 
 GIROS_DIARIOS = 10
-LARGURA_CARTA = 1080
-ALTURA_CARTA = 1700
+LARGURA_CARTA = 736
+ALTURA_CARTA = 1052
 
 TIERS_CONFIG = {
     1: {"nome": "Tier 1 (Comum)", "curto": "Tier 1", "emoji": "🌱", "peso": 48},
