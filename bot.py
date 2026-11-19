@@ -3788,32 +3788,109 @@ async def cmd_del_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Carta não encontrada.")
 
 async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await bloqueio_nao_admin(update):
+    msg = update.effective_message
+    if not msg or await bloqueio_nao_admin(update):
         return
 
+    reply = msg.reply_to_message
+    # Ignora o reply automático que o Telegram cria em grupos com Tópicos (Fóruns)
+    eh_reply_real = (
+        reply is not None
+        and getattr(reply, "forum_topic_created", None) is None
+        and getattr(reply, "forum_topic_edited", None) is None
+        and getattr(reply, "general_forum_topic_hidden", None) is None
+        and getattr(reply, "general_forum_topic_unhidden", None) is None
+        and (
+            not getattr(msg, "is_topic_message", False)
+            or reply.message_id != getattr(msg, "message_thread_id", None)
+        )
+    )
+
+    alvo_id = None
+    alvo_username = ""
+
     try:
-        if update.message.reply_to_message:
-            alvo = update.message.reply_to_message.from_user
+        if eh_reply_real and len(context.args) == 1:
+            alvo = reply.from_user
+            if not alvo or alvo.is_bot:
+                await msg.reply_text("⚠️ Responda à mensagem de um jogador válido (não de um bot).")
+                return
             alvo_id = alvo.id
+            alvo_username = alvo.username or ""
             qtd = int(context.args[0])
-            verificar_usuario(alvo_id, alvo.username)
+            verificar_usuario(alvo_id, alvo_username)
+
+        elif len(context.args) >= 2:
+            qtd = int(context.args[-1])
+            alvo_str = " ".join(context.args[:-1]).strip()
+
+            if alvo_str.isdigit():
+                alvo_id = int(alvo_str)
+                verificar_usuario(alvo_id)
+            else:
+                busca = alvo_str.lstrip("@").strip()
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT user_id, username FROM usuarios
+                    WHERE LOWER(username) = LOWER(%s)
+                       OR LOWER(TRIM(apelido)) = LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (busca, busca),
+                )
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+
+                if not row:
+                    await msg.reply_text(
+                        f"⚠️ Jogador <b>{esc(alvo_str)}</b> não encontrado.\n"
+                        f"Peça para ele usar <code>/start</code> ou <code>/girar</code> primeiro, ou informe o <b>ID numérico</b>.",
+                        parse_mode="HTML",
+                    )
+                    return
+
+                alvo_id, uname_db = row
+                alvo_username = uname_db or ""
         else:
-            alvo_id = int(context.args[0])
-            qtd = int(context.args[1])
-            verificar_usuario(alvo_id)
+            raise ValueError
     except (IndexError, ValueError):
-        await update.message.reply_text("Uso: responda à pessoa com <code>/dargiros 5</code> ou <code>/dargiros ID 5</code>", parse_mode="HTML")
+        await msg.reply_text(
+            "🍃 <b>Como usar /dargiros:</b>\n"
+            "• Responda à mensagem da pessoa: <code>/dargiros 5</code>\n"
+            "• Por ID: <code>/dargiros 123456789 5</code>\n"
+            "• Por @ ou apelido: <code>/dargiros @usuario 5</code>",
+            parse_mode="HTML",
+        )
         return
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes + %s WHERE user_id = %s", (qtd, alvo_id))
+    cur.execute(
+        """
+        UPDATE usuarios
+        SET giros_restantes = GREATEST(0, giros_restantes + %s)
+        WHERE user_id = %s
+        RETURNING giros_restantes
+        """,
+        (qtd, alvo_id),
+    )
+    res = cur.fetchone()
     conn.commit()
     cur.close()
     conn.close()
 
-    await update.message.reply_text(f"🍃 Adicionados <b>{qtd}</b> giros para <code>{alvo_id}</code>.", parse_mode="HTML")
+    novo_total = res[0] if res else qtd
+    apelido_exib, _ = obter_apelido(alvo_id, alvo_username)
+    sinal = "+" if qtd >= 0 else ""
 
+    await msg.reply_text(
+        f"🍃 <b>{sinal}{qtd}</b> giros para 🫧 <b>{esc(apelido_exib)}</b> (<code>{alvo_id}</code>)\n"
+        f"🎯 Total disponível agora: <b>{novo_total}</b>",
+        parse_mode="HTML",
+    )
 async def cmd_add_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
         return
