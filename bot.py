@@ -7,7 +7,7 @@ import psycopg2
 from datetime import date
 from aiohttp import web
 from PIL import Image, ImageOps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -34,6 +34,11 @@ if env_admins:
 GIROS_DIARIOS = 10
 LARGURA_CARTA = 900
 ALTURA_CARTA = 1200
+ED_PAGE_SIZE = 10
+CAT_PAGE_SIZE = 15
+
+# Trava em memória para evitar clique duplo simultâneo no giro
+GIROS_EM_ANDAMENTO: set[int] = set()
 
 TIERS_CONFIG = {
     1: {"nome": "Tier 1 (Comum)", "curto": "Tier 1", "emoji": "🌱", "peso": 48},
@@ -85,6 +90,17 @@ CATALOGO_INICIAL = {
     ED_MIDIA,
     ED_TIER,
 ) = range(9, 18)
+
+# Estados do gerenciador /categorias
+(
+    CM_HOME,
+    CM_CAT_VIEW,
+    CM_NEW_CAT,
+    CM_REN_CAT,
+    CM_SUB_VIEW,
+    CM_NEW_SUB,
+    CM_REN_SUB,
+) = range(18, 25)
 
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
@@ -258,17 +274,44 @@ def processar_imagem_carta(image_bytes: bytes, tier: int) -> io.BytesIO:
     saida.seek(0)
     return saida
 
-async def enviar_midia_carta(message, file_id: str, media_type: str, legenda: str):
-    if media_type == "animation":
-        await message.reply_animation(animation=file_id, caption=legenda, parse_mode="HTML")
-    else:
-        await message.reply_photo(photo=file_id, caption=legenda, parse_mode="HTML")
+async def enviar_midia_carta(message, file_id: str, media_type: str, legenda: str, bot=None):
+    """Envia a foto/GIF da carta com fallback seguro para grupos com restrições."""
+    try:
+        if media_type == "animation":
+            await message.reply_animation(animation=file_id, caption=legenda, parse_mode="HTML")
+        else:
+            await message.reply_photo(photo=file_id, caption=legenda, parse_mode="HTML")
+        return
+    except Exception:
+        pass
+
+    bot_ref = bot or message.get_bot()
+    chat_id = message.chat_id
+    thread_id = getattr(message, "message_thread_id", None)
+    kwargs = {"chat_id": chat_id, "caption": legenda, "parse_mode": "HTML"}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+
+    try:
+        if media_type == "animation":
+            await bot_ref.send_animation(animation=file_id, **kwargs)
+        else:
+            await bot_ref.send_photo(photo=file_id, **kwargs)
+    except Exception:
+        text_kwargs = {"chat_id": chat_id, "text": legenda, "parse_mode": "HTML"}
+        if thread_id:
+            text_kwargs["message_thread_id"] = thread_id
+        await bot_ref.send_message(**text_kwargs)
 
 # ==========================================
 # COMANDOS DE JOGADORES COMUNS
 # ==========================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     user = update.effective_user
+    if not msg or not user:
+        return
+
     giros = verificar_usuario(user.id, user.username)
     apelido, tem_apelido = obter_apelido(user.id, user.username)
 
@@ -278,8 +321,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🍃 Giros disponíveis hoje: <b>{giros}</b>\n\n"
         f"<b>Comandos disponíveis:</b>\n"
         f"• /girar — Escolher uma categoria e sortear uma carta\n"
-        f"• /apelido <code>nome</code> — Definir seu nome de exibição no jogo\n"
+        f"• /apelido <code>nome</code> — Definir seu nome único de exibição no jogo\n"
         f"• /colecao — Ver toda a sua coleção agrupada\n"
+        f"• /catalogo — Ver todas as cartas cadastradas por categoria\n"
         f"• /artista <code>nome</code> — Ver seu progresso nos 5 tiers de um artista/personagem\n"
         f"• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
         f"• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
@@ -290,16 +334,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if eh_admin(user.id):
         texto += "\n\n🛡️ <i>Modo Studio ativo: /studio</i>"
 
-    await update.message.reply_text(texto, parse_mode="HTML")
+    await msg.reply_text(texto, parse_mode="HTML")
 
 async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     user = update.effective_user
+    if not msg or not user:
+        return
+
     verificar_usuario(user.id, user.username)
 
     novo_apelido = " ".join(" ".join(context.args).split()).strip()
     if not novo_apelido:
         atual, _ = obter_apelido(user.id, user.username)
-        await update.message.reply_text(
+        await msg.reply_text(
             f"🫧 Seu nome atual no jogo é: <b>{esc(atual)}</b>\n\n"
             f"Para alterar, envie: <code>/apelido Seu Novo Nome</code>",
             parse_mode="HTML"
@@ -307,7 +355,7 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(novo_apelido) < 2 or len(novo_apelido) > 32:
-        await update.message.reply_text("⚠️ O apelido precisa ter entre <b>2 e 32</b> caracteres.", parse_mode="HTML")
+        await msg.reply_text("⚠️ O apelido precisa ter entre <b>2 e 32</b> caracteres.", parse_mode="HTML")
         return
 
     conn = get_db()
@@ -320,7 +368,7 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cur.fetchone():
         cur.close()
         conn.close()
-        await update.message.reply_text(
+        await msg.reply_text(
             f"⚠️ O apelido <b>{esc(novo_apelido)}</b> já está sendo usado por outro jogador. Escolha outro!",
             parse_mode="HTML"
         )
@@ -333,7 +381,7 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.rollback()
         cur.close()
         conn.close()
-        await update.message.reply_text(
+        await msg.reply_text(
             f"⚠️ O apelido <b>{esc(novo_apelido)}</b> já está sendo usado por outro jogador. Escolha outro!",
             parse_mode="HTML"
         )
@@ -342,20 +390,28 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.close()
     conn.close()
 
-    await update.message.reply_text(
+    await msg.reply_text(
         f"✅ Apelido atualizado para: 🫧 <b>{esc(novo_apelido)}</b>",
         parse_mode="HTML"
     )
 
 async def cmd_meu_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Seu ID numérico é: <code>{update.effective_user.id}</code>", parse_mode="HTML")
+    msg = update.effective_message
+    user = update.effective_user
+    if msg and user:
+        await msg.reply_text(f"Seu ID numérico é: <code>{user.id}</code>", parse_mode="HTML")
 
 async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
+
     giros = verificar_usuario(user.id, user.username)
 
     if giros <= 0:
-        await update.message.reply_text("⏳ Seus giros acabaram por hoje! Volte amanhã.")
+        await msg.reply_text("⏳ Seus giros acabaram por hoje! Volte amanhã.")
         return
 
     conn = get_db()
@@ -377,11 +433,27 @@ async def cmd_girar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     botoes.append([InlineKeyboardButton("🌐 Mix Aleatório (Tudo)", callback_data=f"rcat|all|{user.id}")])
 
-    await update.message.reply_text(
-        f"🍃 Giros restantes: <b>{giros}</b>\nEscolha a categoria:",
-        reply_markup=InlineKeyboardMarkup(botoes),
-        parse_mode="HTML"
+    apelido_user, _ = obter_apelido(user.id, user.username)
+    texto_menu = (
+        f"🫧 <b>{esc(apelido_user)}</b> • 🍃 Giros restantes: <b>{giros}</b>\n"
+        f"Escolha a categoria:"
     )
+    markup = InlineKeyboardMarkup(botoes)
+
+    try:
+        await msg.reply_text(texto_menu, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        kwargs = {"chat_id": chat.id, "text": texto_menu, "reply_markup": markup, "parse_mode": "HTML"}
+        thread_id = getattr(msg, "message_thread_id", None)
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+        try:
+            await context.bot.send_message(**kwargs)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Não consegui exibir os botões neste grupo. Verifique se o bot tem permissão para enviar mensagens e usar teclados inline."
+            )
 
 async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -392,7 +464,7 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
         return
 
     if cat_alvo == "all":
-        await executar_sorteio(query, cat_id=None, sub_id=None)
+        await executar_sorteio(query, context, cat_id=None, sub_id=None)
         return
 
     cat_id = int(cat_alvo)
@@ -410,7 +482,7 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
         return
 
     if not subs:
-        await executar_sorteio(query, cat_id=cat_id, sub_id=None)
+        await executar_sorteio(query, context, cat_id=cat_id, sub_id=None)
         return
 
     botoes = []
@@ -427,7 +499,7 @@ async def callback_girar_categoria(update: Update, context: ContextTypes.DEFAULT
 
     await query.answer()
     await query.edit_message_text(
-        f"💿 <b>{esc(cat_row[0])}</b> — Escolha a categoria:",
+        f"💿 <b>{esc(cat_row[0])}</b> — Escolha a subcategoria:",
         reply_markup=InlineKeyboardMarkup(botoes),
         parse_mode="HTML"
     )
@@ -442,100 +514,332 @@ async def callback_girar_subcategoria(update: Update, context: ContextTypes.DEFA
 
     cat_id = int(cat_id_str)
     sub_id = None if sub_alvo == "all" else int(sub_alvo)
-    await executar_sorteio(query, cat_id=cat_id, sub_id=sub_id)
+    await executar_sorteio(query, context, cat_id=cat_id, sub_id=sub_id)
 
-async def executar_sorteio(query, cat_id=None, sub_id=None):
+async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None):
     user = query.from_user
-    giros = verificar_usuario(user.id, user.username)
-    if giros <= 0:
-        await query.answer("Seus giros acabaram!", show_alert=True)
+
+    if user.id in GIROS_EM_ANDAMENTO:
+        await query.answer("Aguarde o giro atual terminar!", show_alert=True)
         return
+
+    GIROS_EM_ANDAMENTO.add(user.id)
+    try:
+        giros = verificar_usuario(user.id, user.username)
+        if giros <= 0:
+            await query.answer("Seus giros acabaram!", show_alert=True)
+            try:
+                await query.edit_message_text("⏳ Seus giros acabaram por hoje! Volte amanhã.")
+            except Exception:
+                pass
+            return
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        sql_base = """
+            SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, c.tier, c.peso_drop, c.file_id, c.media_type
+            FROM cartas c
+            JOIN categorias cat ON c.categoria_id = cat.id
+            LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        """
+        if cat_id is None:
+            cur.execute(sql_base)
+        elif sub_id is None:
+            cur.execute(sql_base + " WHERE c.categoria_id = %s", (cat_id,))
+        else:
+            cur.execute(sql_base + " WHERE c.categoria_id = %s AND c.subcategoria_id = %s", (cat_id, sub_id))
+
+        cartas = cur.fetchall()
+        if not cartas:
+            await query.answer("Ainda não há cartas cadastradas aqui.", show_alert=True)
+            cur.close()
+            conn.close()
+            return
+
+        # Remove os botões do menu imediatamente para impedir cliques repetidos
+        await query.answer()
+        try:
+            await query.edit_message_text("🎲 <i>Sintonizando mix...</i>", parse_mode="HTML")
+        except Exception:
+            pass
+
+        pesos = [c[7] for c in cartas]
+        (
+            carta_id,
+            nome_carta,
+            cid_cat,
+            nome_cat,
+            cid_sub,
+            nome_sub,
+            tier,
+            _,
+            file_id,
+            media_type,
+        ) = random.choices(cartas, weights=pesos, k=1)[0]
+
+        cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - 1 WHERE user_id = %s", (user.id,))
+        cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
+        item = cur.fetchone()
+
+        if item:
+            qtd_carta = item[1] + 1
+            cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (qtd_carta, item[0]))
+        else:
+            qtd_carta = 1
+            cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
+
+        cur.execute("""
+            SELECT COUNT(DISTINCT c.tier)
+            FROM inventario i
+            JOIN cartas c ON i.carta_id = c.id
+            WHERE i.user_id = %s AND LOWER(c.nome) = LOWER(%s)
+        """, (user.id, nome_carta))
+        tiers_obtidos = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_carta,))
+        tiers_cadastrados = cur.fetchone()[0]
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        apelido_user, _ = obter_apelido(user.id, user.username)
+        tier_info = TIERS_CONFIG[tier]
+        cat_codigo = cid_sub if cid_sub else cid_cat
+        local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
+
+        legenda = (
+            f"🌐 <b>MIX SINTONIZADO! Você desbloqueou:</b>\n\n"
+            f"{tier_info['emoji']} <b>{carta_id}. {esc(nome_carta)}.</b> <i>[{tier_info['curto']}]</i>\n"
+            f"💿 <b>{cat_codigo}. {local_str}</b>\n\n"
+            f"🫧 <b>{esc(apelido_user)}.</b> ({qtd_carta}x) ({tiers_obtidos}/{tiers_cadastrados})\n"
+            f"🌿 <i>Giros restantes: <b>{giros - 1}</b></i>"
+        )
+        await enviar_midia_carta(query.message, file_id, media_type, legenda, bot=context.bot)
+
+        try:
+            await query.edit_message_text(
+                f"🎰 <b>Giro realizado por {esc(apelido_user)}!</b>\n<i>Digite /girar para girar novamente.</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    finally:
+        GIROS_EM_ANDAMENTO.discard(user.id)
+
+# ==========================================
+# CATÁLOGO EM TEXTO COM BOTÕES E PAGINAÇÃO (/catalogo)
+# ==========================================
+async def cmd_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    verificar_usuario(user.id, user.username)
+
+    if update.callback_query:
+        await update.callback_query.answer()
 
     conn = get_db()
     cur = conn.cursor()
+    cur.execute("SELECT id, nome FROM categorias ORDER BY id ASC")
+    categorias = cur.fetchall()
+    cur.close()
+    conn.close()
 
-    sql_base = """
-        SELECT c.id, c.nome, cat.id, cat.nome, sub.id, sub.nome, c.tier, c.peso_drop, c.file_id, c.media_type
+    botoes = []
+    linha = []
+    for cid, cnome in categorias:
+        linha.append(InlineKeyboardButton(cnome, callback_data=f"catlist|cat|{cid}|{user.id}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+
+    botoes.append([InlineKeyboardButton("🌐 Todas as Cartas", callback_data=f"catlist|view|all|all|0|{user.id}")])
+    botoes.append([InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{user.id}")])
+
+    texto = "📜 <b>Catálogo de Cartas</b>\n\nSelecione uma <b>categoria</b> para ver a lista:"
+    markup = InlineKeyboardMarkup(botoes)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+
+async def callback_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    partes = query.data.split("|")
+    acao = partes[1]
+    dono_id = int(partes[-1])
+
+    if query.from_user.id != dono_id:
+        await query.answer("Esse menu pertence a outro jogador! Use /catalogo para abrir o seu.", show_alert=True)
+        return
+
+    if acao == "close":
+        await query.answer("Fechado.")
+        await query.edit_message_text("📜 Catálogo fechado.")
+        return
+
+    if acao == "home":
+        await cmd_catalogo(update, context)
+        return
+
+    if acao == "cat":
+        cat_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+        cat_row = cur.fetchone()
+        cur.execute("SELECT id, nome FROM subcategorias WHERE categoria_id = %s ORDER BY id ASC", (cat_id,))
+        subs = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not cat_row:
+            await query.answer("Categoria não encontrada.", show_alert=True)
+            return
+
+        if not subs:
+            await _renderizar_lista_catalogo(query, cat_alvo=str(cat_id), sub_alvo="all", page=0, user_id=dono_id)
+            return
+
+        await query.answer()
+        botoes = []
+        linha = []
+        for sid, snome in subs:
+            linha.append(InlineKeyboardButton(snome, callback_data=f"catlist|view|{cat_id}|{sid}|0|{dono_id}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+
+        botoes.append([InlineKeyboardButton(f"🌐 Todas de {cat_row[0]}", callback_data=f"catlist|view|{cat_id}|all|0|{dono_id}")])
+        botoes.append([
+            InlineKeyboardButton("⬅️ Categorias", callback_data=f"catlist|home|{dono_id}"),
+            InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{dono_id}"),
+        ])
+
+        await query.edit_message_text(
+            f"💿 <b>{esc(cat_row[0])}</b>\n\nEscolha a <b>subcategoria</b> para listar as cartas:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return
+
+    if acao == "view":
+        cat_alvo = partes[2]
+        sub_alvo = partes[3]
+        page = int(partes[4])
+        await _renderizar_lista_catalogo(query, cat_alvo=cat_alvo, sub_alvo=sub_alvo, page=page, user_id=dono_id)
+
+async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, page: int, user_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+
+    titulo = "Todas as Cartas"
+    where_sql = ""
+    params: list = []
+
+    if cat_alvo != "all":
+        cat_id = int(cat_alvo)
+        cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+        r_cat = cur.fetchone()
+        cat_nome = r_cat[0] if r_cat else f"Cat #{cat_id}"
+
+        if sub_alvo == "all":
+            titulo = esc(cat_nome)
+            where_sql = "WHERE c.categoria_id = %s"
+            params = [cat_id]
+        else:
+            sub_id = int(sub_alvo)
+            cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
+            r_sub = cur.fetchone()
+            sub_nome = r_sub[0] if r_sub else f"Sub #{sub_id}"
+            titulo = f"{esc(cat_nome)} • {esc(sub_nome)}"
+            where_sql = "WHERE c.categoria_id = %s AND c.subcategoria_id = %s"
+            params = [cat_id, sub_id]
+
+    cur.execute(f"SELECT COUNT(*) FROM cartas c {where_sql}", tuple(params))
+    total = cur.fetchone()[0]
+
+    if total == 0:
+        cur.close()
+        conn.close()
+        await query.answer("Nenhuma carta cadastrada nessa seção.", show_alert=True)
+        return
+
+    total_paginas = max(1, (total + CAT_PAGE_SIZE - 1) // CAT_PAGE_SIZE)
+    page = max(0, min(page, total_paginas - 1))
+    offset = page * CAT_PAGE_SIZE
+
+    cur.execute(f"""
+        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
-    """
-    if cat_id is None:
-        cur.execute(sql_base)
-    elif sub_id is None:
-        cur.execute(sql_base + " WHERE c.categoria_id = %s", (cat_id,))
-    else:
-        cur.execute(sql_base + " WHERE c.categoria_id = %s AND c.subcategoria_id = %s", (cat_id, sub_id))
+        {where_sql}
+        ORDER BY c.nome ASC, c.tier ASC, c.id ASC
+        LIMIT %s OFFSET %s
+    """, tuple(params + [CAT_PAGE_SIZE, offset]))
+    rows = cur.fetchall()
 
-    cartas = cur.fetchall()
-    if not cartas:
-        await query.answer("Ainda não há cartas cadastradas aqui.", show_alert=True)
-        cur.close()
-        conn.close()
-        return
-
-    pesos = [c[7] for c in cartas]
-    (
-        carta_id,
-        nome_carta,
-        cid_cat,
-        nome_cat,
-        cid_sub,
-        nome_sub,
-        tier,
-        _,
-        file_id,
-        media_type,
-    ) = random.choices(cartas, weights=pesos, k=1)[0]
-
-    cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - 1 WHERE user_id = %s", (user.id,))
-    cur.execute("SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s", (user.id, carta_id))
-    item = cur.fetchone()
-
-    if item:
-        qtd_carta = item[1] + 1
-        cur.execute("UPDATE inventario SET quantidade = %s WHERE id = %s", (qtd_carta, item[0]))
-    else:
-        qtd_carta = 1
-        cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
-
-    cur.execute("""
-        SELECT COUNT(DISTINCT c.tier)
-        FROM inventario i
-        JOIN cartas c ON i.carta_id = c.id
-        WHERE i.user_id = %s AND LOWER(c.nome) = LOWER(%s)
-    """, (user.id, nome_carta))
-    tiers_obtidos = cur.fetchone()[0]
-
-    cur.execute("SELECT COUNT(*) FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_carta,))
-    tiers_cadastrados = cur.fetchone()[0]
-
-    conn.commit()
+    cur.execute("SELECT carta_id FROM inventario WHERE user_id = %s AND quantidade > 0", (user_id,))
+    possuidas = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
+
     await query.answer()
 
-    apelido_user, _ = obter_apelido(user.id, user.username)
-    tier_info = TIERS_CONFIG[tier]
-    cat_codigo = cid_sub if cid_sub else cid_cat
-    local_str = f"{esc(nome_cat)} • {esc(nome_sub)}" if nome_sub else esc(nome_cat)
+    linhas = [
+        f"📜 <b>Catálogo — {titulo}</b>",
+        f"📦 <b>{total}</b> cartas | Página <b>{page + 1}/{total_paginas}</b>\n",
+    ]
+    for cid, nome, tier, c_nome, s_nome in rows:
+        t_cfg = TIERS_CONFIG[tier]
+        marca = " ✅" if cid in possuidas else ""
+        extra_local = ""
+        if cat_alvo == "all":
+            loc = f"{c_nome} • {s_nome}" if s_nome else c_nome
+            extra_local = f" <i>({esc(loc)})</i>"
+        linhas.append(f"{t_cfg['emoji']} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{t_cfg['curto']}</i>{extra_local}{marca}")
 
-    legenda = (
-        f"🌐 <b>MIX SINTONIZADO! Você desbloqueou:</b>\n\n"
-        f"{tier_info['emoji']} <b>{carta_id}. {esc(nome_carta)}.</b> <i>[{tier_info['curto']}]</i>\n"
-        f"💿 <b>{cat_codigo}. {local_str}</b>\n\n"
-        f"🫧 <b>{esc(apelido_user)}.</b> ({qtd_carta}x) ({tiers_obtidos}/{tiers_cadastrados})\n"
-        f"🌿 <i>Giros restantes: <b>{giros - 1}</b></i>"
+    botoes = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{page - 1}|{user_id}"))
+    if page + 1 < total_paginas:
+        nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{page + 1}|{user_id}"))
+    if nav:
+        botoes.append(nav)
+
+    rodape = [InlineKeyboardButton("🔙 Categorias", callback_data=f"catlist|home|{user_id}")]
+    if cat_alvo != "all":
+        rodape.insert(0, InlineKeyboardButton("📂 Subcategorias", callback_data=f"catlist|cat|{cat_alvo}|{user_id}"))
+    rodape.append(InlineKeyboardButton("❌ Fechar", callback_data=f"catlist|close|{user_id}"))
+    botoes.append(rodape)
+
+    await query.edit_message_text(
+        "\n".join(linhas),
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
     )
-    await enviar_midia_carta(query.message, file_id, media_type, legenda)
 
 async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     user = update.effective_user
+    if not msg or not user:
+        return
+
     verificar_usuario(user.id, user.username)
 
     busca = " ".join(context.args).strip()
     if not busca:
-        await update.message.reply_text("Uso: <code>/artista nome</code> (ex: <code>/artista kuru</code>)", parse_mode="HTML")
+        await msg.reply_text("Uso: <code>/artista nome</code> (ex: <code>/artista kuru</code>)", parse_mode="HTML")
         return
 
     conn = get_db()
@@ -562,7 +866,7 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (f"%{busca}%",))
         resultados = cur.fetchall()
         if not resultados:
-            await update.message.reply_text("Nenhum artista/personagem encontrado com esse nome.")
+            await msg.reply_text("Nenhum artista/personagem encontrado com esse nome.")
             cur.close()
             conn.close()
             return
@@ -604,10 +908,14 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             linhas.append(f"{t_cfg['emoji']} <b>{t_cfg['nome']}:</b> ➖ <i>(Não cadastrada)</i>")
 
-    await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
+    await msg.reply_text("\n".join(linhas), parse_mode="HTML")
 
 async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     user = update.effective_user
+    if not msg or not user:
+        return
+
     verificar_usuario(user.id, user.username)
     apelido_user, _ = obter_apelido(user.id, user.username)
 
@@ -623,7 +931,7 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     itens = cur.fetchall()
 
     if not itens:
-        await update.message.reply_text("Sua coleção está vazia. Use /girar para pegar sua primeira carta!")
+        await msg.reply_text("Sua coleção está vazia. Use /girar para pegar sua primeira carta!")
         cur.close()
         conn.close()
         return
@@ -645,13 +953,17 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         linhas.append(f"{selo}<b>{esc(nome)}</b> [{len(lista)}/{total_existentes}]: {resumo_tiers}")
 
     linhas.append("\n<i>Use /artista nome para ver detalhes por tier.</i>")
-    await update.message.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
+    await msg.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
 
 async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
     try:
         carta_id = int(context.args[0].replace("#", ""))
     except (IndexError, ValueError):
-        await update.message.reply_text("Uso: <code>/carta ID</code> (ex: <code>/carta 5</code>)", parse_mode="HTML")
+        await msg.reply_text("Uso: <code>/carta ID</code> (ex: <code>/carta 5</code>)", parse_mode="HTML")
         return
 
     conn = get_db()
@@ -668,7 +980,7 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not carta:
-        await update.message.reply_text("Carta não encontrada.")
+        await msg.reply_text("Carta não encontrada.")
         return
 
     cid, nome, cid_cat, nome_cat, cid_sub, nome_sub, tier, file_id, media_type = carta
@@ -680,23 +992,27 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💿 <b>{cat_codigo}. {local_str}</b>\n"
         f"🔮 <b>Raridade:</b> {t_cfg['nome']}"
     )
-    await enviar_midia_carta(update.message, file_id, media_type, legenda)
+    await enviar_midia_carta(msg, file_id, media_type, legenda, bot=context.bot)
 
 # ==========================================
 # SISTEMA DE TROCAS (JOGADORES)
 # ==========================================
 async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
     remetente = update.effective_user
+    if not msg or not remetente:
+        return
+
     verificar_usuario(remetente.id, remetente.username)
     rem_apelido, _ = obter_apelido(remetente.id, remetente.username)
 
     destinatario_id = None
     destinatario_apelido = None
 
-    if update.message.reply_to_message and len(context.args) >= 2:
-        alvo = update.message.reply_to_message.from_user
-        if alvo.is_bot or alvo.id == remetente.id:
-            await update.message.reply_text("Responda à mensagem de outro jogador válido.")
+    if msg.reply_to_message and len(context.args) >= 2:
+        alvo = msg.reply_to_message.from_user
+        if not alvo or alvo.is_bot or alvo.id == remetente.id:
+            await msg.reply_text("Responda à mensagem de outro jogador válido.")
             return
         destinatario_id = alvo.id
         verificar_usuario(destinatario_id, alvo.username)
@@ -711,16 +1027,16 @@ async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
         if not row:
-            await update.message.reply_text("Jogador não encontrado. Peça para ele usar /girar primeiro ou responda uma mensagem dele.")
+            await msg.reply_text("Jogador não encontrado. Peça para ele usar /girar primeiro ou responda uma mensagem dele.")
             return
         destinatario_id = row[0]
         if destinatario_id == remetente.id:
-            await update.message.reply_text("Você não pode trocar cartas consigo mesmo.")
+            await msg.reply_text("Você não pode trocar cartas consigo mesmo.")
             return
         destinatario_apelido, _ = obter_apelido(destinatario_id, uname)
         id_str_1, id_str_2 = context.args[1], context.args[2]
     else:
-        await update.message.reply_text(
+        await msg.reply_text(
             "Uso:\n"
             "• Responda à mensagem da pessoa: <code>/trocar SUA_ID ID_DELE</code>\n"
             "• Ou use: <code>/trocar @usuario SUA_ID ID_DELE</code>",
@@ -732,7 +1048,7 @@ async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c_oferecida = int(id_str_1.replace("#", ""))
         c_pedida = int(id_str_2.replace("#", ""))
     except ValueError:
-        await update.message.reply_text("Os IDs das cartas devem ser números.")
+        await msg.reply_text("Os IDs das cartas devem ser números.")
         return
 
     conn = get_db()
@@ -743,12 +1059,12 @@ async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p2 = cur.fetchone()
 
     if not p1 or p1[0] < 1:
-        await update.message.reply_text(f"Você não possui a carta <code>#{c_oferecida}</code>.", parse_mode="HTML")
+        await msg.reply_text(f"Você não possui a carta <code>#{c_oferecida}</code>.", parse_mode="HTML")
         cur.close()
         conn.close()
         return
     if not p2 or p2[0] < 1:
-        await update.message.reply_text(f"{esc(destinatario_apelido)} não possui a carta <code>#{c_pedida}</code>.", parse_mode="HTML")
+        await msg.reply_text(f"{esc(destinatario_apelido)} não possui a carta <code>#{c_pedida}</code>.", parse_mode="HTML")
         cur.close()
         conn.close()
         return
@@ -778,7 +1094,7 @@ async def cmd_trocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🫧 Para <b>{esc(destinatario_apelido)}</b> em troca de:\n"
         f"   💿 <code>#{c_pedida}</code> — {esc(info2[0])} (Tier {info2[1]})"
     )
-    await update.message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+    await msg.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
 async def callback_troca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -952,11 +1268,14 @@ async def wiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["admin_id"] = update.effective_user.id
 
-    await update.message.reply_text(
-        "💿 <b>Nova Carta — Passo 1/5</b>\n\nEscolha a <b>categoria</b> ou crie uma nova:",
-        reply_markup=montar_teclado_categorias(),
-        parse_mode="HTML"
-    )
+    texto = "💿 <b>Nova Carta — Passo 1/5</b>\n\nEscolha a <b>categoria</b> ou crie uma nova:"
+    markup = montar_teclado_categorias()
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return ST_CAT
 
 async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1309,7 +1628,7 @@ async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
-# ASSISTENTE INTERATIVO /editcarta (COM BOTÕES)
+# ASSISTENTE INTERATIVO /editcarta (COM PAGINAÇÃO)
 # ==========================================
 def _carregar_carta_dict(carta_id: int) -> dict | None:
     conn = get_db()
@@ -1339,6 +1658,52 @@ def _carregar_carta_dict(carta_id: int) -> dict | None:
         "media_type": row[8],
     }
 
+def _montar_lista_selecao_edicao(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM cartas")
+    total = cur.fetchone()[0]
+
+    total_paginas = max(1, (total + ED_PAGE_SIZE - 1) // ED_PAGE_SIZE)
+    page = max(0, min(page, total_paginas - 1))
+    offset = page * ED_PAGE_SIZE
+
+    cur.execute(
+        "SELECT id, nome, tier FROM cartas ORDER BY id DESC LIMIT %s OFFSET %s",
+        (ED_PAGE_SIZE, offset)
+    )
+    cartas_pag = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    botoes = []
+    linha = []
+    for cid, cnome, ctier in cartas_pag:
+        emoji = TIERS_CONFIG[ctier]["emoji"]
+        linha.append(InlineKeyboardButton(f"#{cid} {cnome} {emoji}", callback_data=f"ed_pick|{cid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+
+    if total_paginas > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"ed_page|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_paginas}", callback_data="ed_noop"))
+        if page + 1 < total_paginas:
+            nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"ed_page|{page + 1}"))
+        botoes.append(nav)
+
+    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel")])
+
+    texto = (
+        f"🛠️ <b>Editar Carta</b> <i>(Página {page + 1}/{total_paginas} • {total} cartas)</i>\n\n"
+        f"Escolha uma carta nos botões ou digite o <b>ID da carta</b>:"
+    )
+    return texto, InlineKeyboardMarkup(botoes)
+
 def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
     t_cfg = TIERS_CONFIG[d["tier"]]
     cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
@@ -1365,6 +1730,9 @@ def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("✅ Salvar alterações", callback_data="ed_salvar"),
+            InlineKeyboardButton("🔙 Lista de Cartas", callback_data="ed_back_list"),
+        ],
+        [
             InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel"),
         ],
     ]
@@ -1376,43 +1744,26 @@ async def ed_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
     context.user_data["admin_id"] = update.effective_user.id
+    context.user_data["ed_page"] = 0
 
-    if context.args:
+    if not update.callback_query and context.args:
         alvo_raw = context.args[0].replace("#", "").strip()
         if alvo_raw.isdigit():
             d = _carregar_carta_dict(int(alvo_raw))
             if not d:
-                await update.message.reply_text("Carta não encontrada com esse ID.")
+                await update.effective_message.reply_text("Carta não encontrada com esse ID.")
                 return ConversationHandler.END
             context.user_data["ed_carta"] = d
             texto, markup = _montar_menu_edicao(d)
-            await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+            await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
             return ED_MENU
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, nome, tier FROM cartas ORDER BY id DESC LIMIT 12")
-    ultimas = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    botoes = []
-    linha = []
-    for cid, cnome, ctier in ultimas:
-        emoji = TIERS_CONFIG[ctier]["emoji"]
-        linha.append(InlineKeyboardButton(f"#{cid} {cnome} {emoji}", callback_data=f"ed_pick|{cid}"))
-        if len(linha) == 2:
-            botoes.append(linha)
-            linha = []
-    if linha:
-        botoes.append(linha)
-    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel")])
-
-    await update.message.reply_text(
-        "🛠️ <b>Editar Carta</b>\n\nEscolha uma carta nos botões ou digite o <b>ID da carta</b>:",
-        reply_markup=InlineKeyboardMarkup(botoes),
-        parse_mode="HTML"
-    )
+    texto, markup = _montar_lista_selecao_edicao(0)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return ED_MENU
 
 async def ed_receber_id_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1438,6 +1789,25 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != context.user_data.get("admin_id"):
         await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_MENU
+
+    if query.data == "ed_noop":
+        await query.answer()
+        return ED_MENU
+
+    if query.data.startswith("ed_page|"):
+        nova_pag = int(query.data.split("|")[1])
+        context.user_data["ed_page"] = nova_pag
+        await query.answer()
+        texto, markup = _montar_lista_selecao_edicao(nova_pag)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    if query.data == "ed_back_list":
+        await query.answer()
+        pag = context.user_data.get("ed_page", 0)
+        texto, markup = _montar_lista_selecao_edicao(pag)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
         return ED_MENU
 
     if query.data.startswith("ed_pick|"):
@@ -1835,6 +2205,374 @@ async def ed_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
+# GERENCIADOR INTERATIVO DE CATEGORIAS (/categorias)
+# ==========================================
+def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.id, c.nome,
+               (SELECT COUNT(*) FROM subcategorias s WHERE s.categoria_id = c.id),
+               (SELECT COUNT(*) FROM cartas ct WHERE ct.categoria_id = c.id)
+        FROM categorias c
+        ORDER BY c.id ASC
+    """)
+    cats = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    linhas = ["📂 <b>Gerenciar Categorias & Subcategorias</b>\n"]
+    botoes = []
+    linha = []
+    for cid, cnome, qtd_subs, qtd_cartas in cats:
+        linhas.append(f"• <code>[{cid}]</code> <b>{esc(cnome)}</b> — {qtd_subs} subs | {qtd_cartas} cartas")
+        linha.append(InlineKeyboardButton(f"{cnome}", callback_data=f"catmgr|cat|{cid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+
+    botoes.append([InlineKeyboardButton("➕ Criar Nova Categoria", callback_data="catmgr|new_cat")])
+    botoes.append([InlineKeyboardButton("❌ Fechar", callback_data="catmgr|close")])
+    linhas.append("\nToque em uma categoria para editar ou criar subcategorias:")
+    return "\n".join(linhas), InlineKeyboardMarkup(botoes)
+
+def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+    r_cat = cur.fetchone()
+    if not r_cat:
+        cur.close()
+        conn.close()
+        return None
+    cat_nome = r_cat[0]
+
+    cur.execute("SELECT COUNT(*) FROM cartas WHERE categoria_id = %s", (cat_id,))
+    total_cartas = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT s.id, s.nome, (SELECT COUNT(*) FROM cartas ct WHERE ct.subcategoria_id = s.id)
+        FROM subcategorias s
+        WHERE s.categoria_id = %s
+        ORDER BY s.id ASC
+    """, (cat_id,))
+    subs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    linhas = [
+        f"📂 <b>Categoria #{cat_id}: {esc(cat_nome)}</b>",
+        f"💿 Cartas vinculadas: <b>{total_cartas}</b>\n",
+    ]
+    botoes = [
+        [
+            InlineKeyboardButton("✏️ Renomear Categoria", callback_data="catmgr|ren_cat"),
+            InlineKeyboardButton("➕ Nova Subcategoria", callback_data="catmgr|new_sub"),
+        ]
+    ]
+
+    if subs:
+        linhas.append("<b>Subcategorias:</b>")
+        linha = []
+        for sid, snome, scartas in subs:
+            linhas.append(f"   ↳ <code>[{sid}]</code> {esc(snome)} ({scartas} cartas)")
+            linha.append(InlineKeyboardButton(f"📑 {snome}", callback_data=f"catmgr|sub|{sid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+    else:
+        linhas.append("<i>Nenhuma subcategoria cadastrada.</i>")
+
+    botoes.append([
+        InlineKeyboardButton("🗑️ Excluir Categoria", callback_data="catmgr|del_cat"),
+        InlineKeyboardButton("⬅️ Voltar", callback_data="catmgr|home"),
+    ])
+    return "\n".join(linhas), InlineKeyboardMarkup(botoes)
+
+def _montar_view_subcategoria(sub_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.id, s.nome, s.categoria_id, c.nome,
+               (SELECT COUNT(*) FROM cartas ct WHERE ct.subcategoria_id = s.id)
+        FROM subcategorias s
+        JOIN categorias c ON s.categoria_id = c.id
+        WHERE s.id = %s
+    """, (sub_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+
+    _, sub_nome, cat_id, cat_nome, qtd_cartas = row
+    texto = (
+        f"📑 <b>Subcategoria #{sub_id}: {esc(sub_nome)}</b>\n"
+        f"📂 Categoria pai: <b>{esc(cat_nome)}</b>\n"
+        f"💿 Cartas vinculadas: <b>{qtd_cartas}</b>"
+    )
+    botoes = [
+        [
+            InlineKeyboardButton("✏️ Renomear Subcategoria", callback_data="catmgr|ren_sub"),
+            InlineKeyboardButton("🗑️ Excluir Subcategoria", callback_data="catmgr|del_sub"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Voltar", callback_data=f"catmgr|cat|{cat_id}"),
+        ],
+    ]
+    return texto, InlineKeyboardMarkup(botoes)
+
+async def catmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["admin_id"] = update.effective_user.id
+
+    texto, markup = _montar_home_categorias()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return CM_HOME
+
+async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return CM_HOME
+
+    partes = query.data.split("|")
+    acao = partes[1]
+
+    if acao == "close":
+        await query.answer("Fechado.")
+        await query.edit_message_text("📂 Gerenciador de categorias fechado.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if acao == "home":
+        await query.answer()
+        texto, markup = _montar_home_categorias()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return CM_HOME
+
+    if acao == "new_cat":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>nome da nova categoria</b>:", parse_mode="HTML")
+        return CM_NEW_CAT
+
+    if acao == "cat":
+        cat_id = int(partes[2])
+        res = _montar_view_categoria(cat_id)
+        if not res:
+            await query.answer("Categoria não encontrada.", show_alert=True)
+            return CM_HOME
+        await query.answer()
+        context.user_data["cm_cat_id"] = cat_id
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_CAT_VIEW
+
+    if acao == "ren_cat":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>novo nome</b> para esta categoria:", parse_mode="HTML")
+        return CM_REN_CAT
+
+    if acao == "new_sub":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>nome da nova subcategoria</b>:", parse_mode="HTML")
+        return CM_NEW_SUB
+
+    if acao == "del_cat":
+        cat_id = context.user_data.get("cm_cat_id")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cartas WHERE categoria_id = %s", (cat_id,))
+        qtd = cur.fetchone()[0]
+        if qtd > 0:
+            cur.close()
+            conn.close()
+            await query.answer(f"Não é possível excluir: existem {qtd} cartas nessa categoria!", show_alert=True)
+            return CM_CAT_VIEW
+        cur.execute("DELETE FROM categorias WHERE id = %s", (cat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Categoria excluída!")
+        texto, markup = _montar_home_categorias()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return CM_HOME
+
+    if acao == "sub":
+        sub_id = int(partes[2])
+        res = _montar_view_subcategoria(sub_id)
+        if not res:
+            await query.answer("Subcategoria não encontrada.", show_alert=True)
+            return CM_CAT_VIEW
+        await query.answer()
+        context.user_data["cm_sub_id"] = sub_id
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_SUB_VIEW
+
+    if acao == "ren_sub":
+        await query.answer()
+        await query.edit_message_text("✏️ Digite o <b>novo nome</b> para esta subcategoria:", parse_mode="HTML")
+        return CM_REN_SUB
+
+    if acao == "del_sub":
+        sub_id = context.user_data.get("cm_sub_id")
+        cat_id = context.user_data.get("cm_cat_id")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cartas WHERE subcategoria_id = %s", (sub_id,))
+        qtd = cur.fetchone()[0]
+        if qtd > 0:
+            cur.close()
+            conn.close()
+            await query.answer(f"Não é possível excluir: existem {qtd} cartas nessa subcategoria!", show_alert=True)
+            return CM_SUB_VIEW
+        cur.execute("DELETE FROM subcategorias WHERE id = %s", (sub_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Subcategoria excluída!")
+        res = _montar_view_categoria(cat_id)
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_CAT_VIEW
+
+    return CM_HOME
+
+async def catmgr_receber_nova_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_NEW_CAT
+
+    nome = update.message.text.strip()
+    if not nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_NEW_CAT
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM categorias WHERE LOWER(nome) = LOWER(%s)", (nome,))
+    existente = cur.fetchone()
+    if existente:
+        cat_id = existente[0]
+    else:
+        cur.execute("INSERT INTO categorias (nome) VALUES (%s) RETURNING id", (nome,))
+        cat_id = cur.fetchone()[0]
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    context.user_data["cm_cat_id"] = cat_id
+    res = _montar_view_categoria(cat_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_CAT_VIEW
+
+async def catmgr_receber_ren_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_REN_CAT
+
+    novo_nome = update.message.text.strip()
+    cat_id = context.user_data.get("cm_cat_id")
+    if not novo_nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_REN_CAT
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM categorias WHERE LOWER(nome) = LOWER(%s) AND id != %s", (novo_nome, cat_id))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        await update.message.reply_text("⚠️ Já existe outra categoria com esse nome. Digite outro:")
+        return CM_REN_CAT
+
+    cur.execute("UPDATE categorias SET nome = %s WHERE id = %s", (novo_nome, cat_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    res = _montar_view_categoria(cat_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_CAT_VIEW
+
+async def catmgr_receber_nova_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_NEW_SUB
+
+    nome = update.message.text.strip()
+    cat_id = context.user_data.get("cm_cat_id")
+    if not nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_NEW_SUB
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM subcategorias WHERE categoria_id = %s AND LOWER(nome) = LOWER(%s)",
+        (cat_id, nome)
+    )
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO subcategorias (categoria_id, nome) VALUES (%s, %s)",
+            (cat_id, nome)
+        )
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    res = _montar_view_categoria(cat_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_CAT_VIEW
+
+async def catmgr_receber_ren_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return CM_REN_SUB
+
+    novo_nome = update.message.text.strip()
+    sub_id = context.user_data.get("cm_sub_id")
+    cat_id = context.user_data.get("cm_cat_id")
+    if not novo_nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return CM_REN_SUB
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM subcategorias WHERE categoria_id = %s AND LOWER(nome) = LOWER(%s) AND id != %s",
+        (cat_id, novo_nome, sub_id)
+    )
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        await update.message.reply_text("⚠️ Já existe outra subcategoria com esse nome nessa categoria. Digite outro:")
+        return CM_REN_SUB
+
+    cur.execute("UPDATE subcategorias SET nome = %s WHERE id = %s", (novo_nome, sub_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    res = _montar_view_subcategoria(sub_id)
+    await update.message.reply_text(res[0], reply_markup=res[1], parse_mode="HTML")
+    return CM_SUB_VIEW
+
+async def catmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer("Fechado.")
+        await update.callback_query.edit_message_text("📂 Gerenciador de categorias fechado.")
+    else:
+        await update.message.reply_text("📂 Gerenciador de categorias fechado.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ==========================================
 # COMANDOS EXCLUSIVOS DE ADMIN (/studio)
 # ==========================================
 async def bloqueio_nao_admin(update: Update) -> bool:
@@ -1847,22 +2585,34 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎛️ <b>Ecco-Mix Studio (Painel Admin)</b>\n\n"
         "<b>Criar & Gerenciar Cartas:</b>\n"
         f"• /addcarta — Assistente interativo com botões (Categoria → Subcategoria → Nome → Foto {LARGURA_CARTA}×{ALTURA_CARTA} → Tier)\n"
-        "• /editcarta (ou <code>/editcarta ID</code>) — Assistente com botões para editar Nome, Categoria, Foto/GIF ou Tier\n"
+        "• /editcarta (ou <code>/editcarta ID</code>) — Assistente com botões e paginação para editar cartas\n"
+        "• /catalogo — Listar cartas por categoria/subcategoria com paginação\n"
         "• /delcarta <code>ID</code> — Excluir uma carta\n\n"
         "<b>Molduras PNG por Tier (Opcional):</b>\n"
         "• /moldura <code>1 a 5</code> — Responda a um arquivo <b>.PNG transparente</b> para definir a moldura daquele Tier\n"
         "• /molduras — Ver quais Tiers têm moldura ativa\n"
         "• /remmoldura <code>1 a 5</code> — Remover moldura de um Tier\n\n"
         "<b>Categorias & Subcategorias:</b>\n"
-        "• /listacat — Ver IDs e nomes de categorias e subcategorias\n"
-        "• /editcat <code>ID | NovoNome</code> — Renomear categoria\n"
-        "• /editsub <code>ID | NovoNome</code> — Renomear subcategoria\n\n"
+        "• /categorias — Gerenciar categorias e subcategorias por botões (criar, renomear, excluir)\n"
+        "• /listacat — Ver lista rápida de IDs e nomes\n"
+        "• /editcat <code>ID | NovoNome</code> — Atalho para renomear categoria\n"
+        "• /editsub <code>ID | NovoNome</code> — Atalho para renomear subcategoria\n\n"
         "<b>Giros & Equipe:</b>\n"
         "• /dargiros <code>qtd</code> (respondendo a alguém) ou <code>ID qtd</code>\n"
         "• /addadm <code>ID</code> (ou responda a alguém) — Adicionar admin\n"
         "• /remadm <code>ID</code> — Remover admin"
     )
-    await update.message.reply_text(texto, parse_mode="HTML")
+    botoes = [
+        [
+            InlineKeyboardButton("➕ Nova Carta", callback_data="studio_go|addcarta"),
+            InlineKeyboardButton("🛠️ Editar Carta", callback_data="studio_go|editcarta"),
+        ],
+        [
+            InlineKeyboardButton("📂 Categorias & Subs", callback_data="studio_go|categorias"),
+            InlineKeyboardButton("📜 Catálogo", callback_data="studio_go|catalogo"),
+        ],
+    ]
+    await update.effective_message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
 async def cmd_set_moldura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
@@ -2120,7 +2870,10 @@ async def main():
 
     # Assistente interativo /addcarta
     conv_carta = ConversationHandler(
-        entry_points=[CommandHandler("addcarta", wiz_start)],
+        entry_points=[
+            CommandHandler("addcarta", wiz_start),
+            CallbackQueryHandler(wiz_start, pattern=r"^studio_go\|addcarta$"),
+        ],
         states={
             ST_CAT: [CallbackQueryHandler(wiz_escolher_cat, pattern=r"^wiz_(cat\|.+|new_cat)$")],
             ST_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_receber_nova_cat)],
@@ -2142,12 +2895,15 @@ async def main():
     )
     app.add_handler(conv_carta)
 
-    # Assistente interativo /editcarta
+    # Assistente interativo /editcarta (com paginação)
     conv_edit_carta = ConversationHandler(
-        entry_points=[CommandHandler("editcarta", ed_start)],
+        entry_points=[
+            CommandHandler("editcarta", ed_start),
+            CallbackQueryHandler(ed_start, pattern=r"^studio_go\|editcarta$"),
+        ],
         states={
             ED_MENU: [
-                CallbackQueryHandler(ed_menu_callback, pattern=r"^ed_(pick\||op\||salvar$)"),
+                CallbackQueryHandler(ed_menu_callback, pattern=r"^ed_(pick\||page\||back_list$|noop$|op\||salvar$)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_id_texto),
             ],
             ED_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nome)],
@@ -2169,11 +2925,37 @@ async def main():
     )
     app.add_handler(conv_edit_carta)
 
+    # Gerenciador interativo /categorias
+    conv_catmgr = ConversationHandler(
+        entry_points=[
+            CommandHandler("categorias", catmgr_start),
+            CallbackQueryHandler(catmgr_start, pattern=r"^studio_go\|categorias$"),
+        ],
+        states={
+            CM_HOME: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(cat\||new_cat$|home$|close$)")],
+            CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|new_sub$|del_cat$|sub\||home$|close$)")],
+            CM_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_cat)],
+            CM_REN_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_cat)],
+            CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|del_sub$|cat\||home$|close$)")],
+            CM_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_sub)],
+            CM_REN_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_sub)],
+        },
+        fallbacks=[
+            CommandHandler("cancelar", catmgr_cancel),
+            CallbackQueryHandler(catmgr_cancel, pattern=r"^catmgr\|close$"),
+        ],
+        allow_reentry=True,
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(conv_catmgr)
+
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
     app.add_handler(CommandHandler("meuid", cmd_meu_id))
     app.add_handler(CommandHandler("girar", cmd_girar))
+    app.add_handler(CommandHandler(["catalogo", "cartas"], cmd_catalogo))
     app.add_handler(CommandHandler("artista", cmd_artista))
     app.add_handler(CommandHandler("colecao", cmd_colecao))
     app.add_handler(CommandHandler("carta", cmd_carta))
@@ -2195,6 +2977,8 @@ async def main():
     # Botões Interativos do Jogo
     app.add_handler(CallbackQueryHandler(callback_girar_categoria, pattern=r"^rcat\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_subcategoria, pattern=r"^rsub\|"))
+    app.add_handler(CallbackQueryHandler(callback_catalogo, pattern=r"^catlist\|"))
+    app.add_handler(CallbackQueryHandler(cmd_catalogo, pattern=r"^studio_go\|catalogo$"))
     app.add_handler(CallbackQueryHandler(callback_troca, pattern=r"^trade\|"))
 
     async def handle_webhook(request):
@@ -2217,6 +3001,19 @@ async def main():
 
     await app.initialize()
     await app.start()
+
+    # Registra comandos no menu "/" do Telegram (essencial para grupos)
+    await app.bot.set_my_commands([
+        BotCommand("girar", "Escolher categoria e sortear uma carta"),
+        BotCommand("colecao", "Ver toda a sua coleção"),
+        BotCommand("catalogo", "Listar cartas por categoria"),
+        BotCommand("artista", "Ver progresso dos 5 tiers de um artista"),
+        BotCommand("carta", "Visualizar uma carta pelo ID"),
+        BotCommand("trocar", "Propor troca de cartas"),
+        BotCommand("apelido", "Definir seu apelido único no jogo"),
+        BotCommand("meuid", "Ver seu ID numérico"),
+    ])
+
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
 
     await asyncio.Event().wait()
