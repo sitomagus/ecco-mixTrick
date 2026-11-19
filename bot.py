@@ -71,7 +71,7 @@ TEXTOS_PADRAO = {
         "📜 <b>Comandos do Ecco-Mix Trick</b>\n\n"
         "• /colecao — Ver toda a sua coleção agrupada\n"
         "• /catalogo — Ver todas as cartas cadastradas por categoria\n"
-        "• /artista <code>nome</code> — Ver seu progresso nos 5 tiers de um artista/personagem\n"
+        "• /artista <code>nome</code> — Ver seu progresso nos tiers de um artista/personagem\n"
         "• /ranking <code>nome</code> — Ver ranking de jogadores de um artista/personagem\n"
         "• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
         "• /trocar <code>minha_id</code> <code>id_dele</code> — Propor troca (responda à mensagem da pessoa)\n"
@@ -377,7 +377,8 @@ def iniciar_banco():
         );
         CREATE TABLE IF NOT EXISTS categorias (
             id SERIAL PRIMARY KEY,
-            nome TEXT UNIQUE NOT NULL
+            nome TEXT UNIQUE NOT NULL,
+            usa_tiers BOOLEAN NOT NULL DEFAULT TRUE
         );
         CREATE TABLE IF NOT EXISTS subcategorias (
             id SERIAL PRIMARY KEY,
@@ -434,6 +435,17 @@ def iniciar_banco():
         );
     """)
 
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'categorias' AND column_name = 'usa_tiers'
+    """)
+    if not cur.fetchone():
+        cur.execute("ALTER TABLE categorias ADD COLUMN usa_tiers BOOLEAN NOT NULL DEFAULT TRUE;")
+        cur.execute("""
+            UPDATE categorias SET usa_tiers = FALSE
+            WHERE LOWER(TRIM(nome)) IN ('animes', 'séries', 'series', 'filmes', 'variedades')
+        """)
+
     # Migração segura: coluna apelido em usuarios
     cur.execute("""
         SELECT 1 FROM information_schema.columns
@@ -468,7 +480,9 @@ def iniciar_banco():
     cur.execute("SELECT COUNT(*) FROM categorias")
     if cur.fetchone()[0] == 0:
         for cat_nome, subs in CATALOGO_INICIAL.items():
-            cur.execute("INSERT INTO categorias (nome) VALUES (%s) RETURNING id", (cat_nome,))
+            nomes_sem_tiers = {"animes", "séries", "series", "filmes", "variedades"}
+            usa_tiers = cat_nome.strip().lower() not in nomes_sem_tiers
+            cur.execute("INSERT INTO categorias (nome, usa_tiers) VALUES (%s, %s) RETURNING id", (cat_nome, usa_tiers))
             cat_id = cur.fetchone()[0]
             for sub_nome in subs:
                 cur.execute(
@@ -524,6 +538,15 @@ def obter_texto_publico(chave: str) -> str:
 
 def obter_emoji_tier(tier: int) -> str:
     return obter_config_valor(f"tier_emoji_{tier}", TIERS_CONFIG[tier]["emoji"])
+
+def categoria_usa_tiers(cat_id: int) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT usa_tiers FROM categorias WHERE id = %s", (cat_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row[0]) if row else True
 
 def eh_admin(user_id: int) -> bool:
     if user_id in SUPER_ADMINS:
@@ -1330,12 +1353,8 @@ async def _processar_giros_core(
                 giros_restantes=giros_restantes,
             )
 
-            legenda_completa = f"{legenda}\n\n{rodape_txt}"
-            if len(legenda_completa) <= 1024:
-                await enviar_midia_carta(reply_anchor, file_id, media_type, legenda_completa, bot=bot)
-            else:
-                await enviar_midia_carta(reply_anchor, file_id, media_type, legenda, bot=bot)
-                await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id, reply_to_message=reply_anchor)
+            await enviar_midia_carta(reply_anchor, file_id, media_type, legenda, bot=bot)
+            await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id)
         else:
             conn.commit()
             cur.close()
@@ -1368,18 +1387,15 @@ async def _processar_giros_core(
                 linhas.append(f"{em} <code>#{cid}</code> <b>{esc(c_nome)}</b> <i>[{t_c}]</i>{vezes_txt}{tag_nova}")
 
             legenda = "\n".join(linhas)
-            legenda_completa = f"{legenda}\n\n{rodape_txt}"
-            if len(legenda_completa) <= 1024:
-                await enviar_midia_carta(reply_anchor, d_file, d_media, legenda_completa, bot=bot)
-            else:
-                await enviar_midia_carta(
-                    reply_anchor,
-                    d_file,
-                    d_media,
-                    f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{d_id} {esc(d_nome)}</b> <i>[{destaque_info['curto']}]</i>",
-                    bot=bot,
-                )
-                await enviar_texto_seguro(chat_id, legenda_completa[:4000], bot, thread_id=thread_id, reply_to_message=reply_anchor)
+            await enviar_midia_carta(
+                reply_anchor,
+                d_file,
+                d_media,
+                f"🌟 <b>Destaque:</b> {destaque_emoji} <b>#{d_id} {esc(d_nome)}</b> <i>[{destaque_info['curto']}]</i>",
+                bot=bot,
+            )
+            await enviar_texto_seguro(chat_id, legenda, bot, thread_id=thread_id)
+            await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id)
 
         if menu_message:
             try:
@@ -2680,13 +2696,15 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nome_carta = context.user_data["nome_carta"]
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s)", (nome_carta,))
+    cat_id = context.user_data["cat_id"]
+    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s", (nome_carta, cat_id))
     ocupados = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
 
     botoes = []
-    for t in range(1, 6):
+    tiers_disponiveis = range(1, 6) if categoria_usa_tiers(cat_id) else range(1, 2)
+    for t in tiers_disponiveis:
         t_cfg = TIERS_CONFIG[t]
         em_btn = texto_limpo_botao(obter_emoji_tier(t))
         if t in ocupados:
@@ -2982,7 +3000,9 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "ed_salvar":
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s AND id != %s", (d["nome"], d["tier"], d["id"]))
+        if not categoria_usa_tiers(d["cat_id"]):
+            d["tier"] = 1
+        cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s AND tier = %s AND id != %s", (d["nome"], d["cat_id"], d["tier"], d["id"]))
         conflito = cur.fetchone()
         if conflito:
             cur.close()
@@ -3063,13 +3083,14 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if op == "tier":
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND id != %s", (d["nome"], d["id"]))
+        cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s AND id != %s", (d["nome"], d["cat_id"], d["id"]))
         ocupados = {r[0] for r in cur.fetchall()}
         cur.close()
         conn.close()
 
         botoes = []
-        for t in range(1, 6):
+        tiers_disponiveis = range(1, 6) if categoria_usa_tiers(d["cat_id"]) else range(1, 2)
+        for t in tiers_disponiveis:
             t_cfg = TIERS_CONFIG[t]
             em_btn = texto_limpo_botao(obter_emoji_tier(t))
             if t in ocupados:
@@ -3100,7 +3121,7 @@ async def ed_receber_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data["ed_carta"]
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s AND id != %s", (novo_nome, d["tier"], d["id"]))
+    cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s AND tier = %s AND id != %s", (novo_nome, d["cat_id"], d["tier"], d["id"]))
     conflito = cur.fetchone()
     cur.close()
     conn.close()
@@ -3516,13 +3537,13 @@ def _montar_home_categorias() -> tuple[str, InlineKeyboardMarkup]:
 def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+    cur.execute("SELECT nome, usa_tiers FROM categorias WHERE id = %s", (cat_id,))
     r_cat = cur.fetchone()
     if not r_cat:
         cur.close()
         conn.close()
         return None
-    cat_nome = r_cat[0]
+    cat_nome, usa_tiers = r_cat
 
     cur.execute("SELECT COUNT(*) FROM cartas WHERE categoria_id = %s", (cat_id,))
     total_cartas = cur.fetchone()[0]
@@ -3544,6 +3565,10 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
         f"💿 Cartas vinculadas: <b>{total_cartas}</b>\n",
     ]
     botoes = [
+        [InlineKeyboardButton(
+            "💎 Tiers: 5 níveis (desativar)" if usa_tiers else "💎 Tiers: unitário (ativar 5 níveis)",
+            callback_data="catmgr|toggle_tiers",
+        )],
         [
             InlineKeyboardButton("✏️ Renomear Categoria", callback_data="catmgr|ren_cat"),
             InlineKeyboardButton("➕ Nova Subcategoria", callback_data="catmgr|new_sub"),
@@ -3570,6 +3595,52 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
         InlineKeyboardButton("⬅️ Voltar", callback_data="catmgr|home"),
     ])
     return "\n".join(linhas), InlineKeyboardMarkup(botoes)
+
+def consolidar_categoria_em_tier_unico(cur, cat_id: int):
+    """Keep one card per character, preferring Tier 1, and merge owned quantities."""
+    cur.execute(
+        "SELECT id, nome, tier FROM cartas WHERE categoria_id = %s ORDER BY LOWER(nome), tier, id",
+        (cat_id,),
+    )
+    grupos = {}
+    for carta_id, nome, tier in cur.fetchall():
+        grupos.setdefault(nome.strip().casefold(), []).append((carta_id, nome, tier))
+
+    for cartas_nome in grupos.values():
+        keeper_id = next((cid for cid, _, tier in cartas_nome if tier == 1), cartas_nome[0][0])
+        for carta_id, _, _ in cartas_nome:
+            if carta_id == keeper_id:
+                continue
+            cur.execute(
+                "SELECT user_id, SUM(quantidade) FROM inventario WHERE carta_id = %s GROUP BY user_id",
+                (carta_id,),
+            )
+            for user_id, quantidade in cur.fetchall():
+                cur.execute(
+                    "SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s ORDER BY id",
+                    (user_id, keeper_id),
+                )
+                registros = cur.fetchall()
+                if registros:
+                    cur.execute(
+                        "UPDATE inventario SET quantidade = %s WHERE id = %s",
+                        (sum(q for _, q in registros) + quantidade, registros[0][0]),
+                    )
+                    extras = [row_id for row_id, _ in registros[1:]]
+                    if extras:
+                        cur.execute("DELETE FROM inventario WHERE id = ANY(%s)", (extras,))
+                else:
+                    cur.execute(
+                        "INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, %s)",
+                        (user_id, keeper_id, quantidade),
+                    )
+            cur.execute("DELETE FROM trocas WHERE status = 'pendente' AND (carta_oferecida_id = %s OR carta_pedida_id = %s)", (carta_id, carta_id))
+            cur.execute("DELETE FROM cartas WHERE id = %s", (carta_id,))
+
+        cur.execute(
+            "UPDATE cartas SET tier = 1, peso_drop = %s WHERE id = %s",
+            (TIERS_CONFIG[1]["peso"], keeper_id),
+        )
 
 def _montar_view_subcategoria(sub_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
     conn = get_db()
@@ -3722,6 +3793,69 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.edit_message_text("✏️ Digite o <b>novo nome</b> para esta categoria:", parse_mode="HTML")
         return CM_REN_CAT
+
+    if acao == "toggle_tiers":
+        cat_id = context.user_data.get("cm_cat_id")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT usa_tiers FROM categorias WHERE id = %s", (cat_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            await query.answer("Categoria não encontrada.", show_alert=True)
+            return CM_HOME
+        usa_tiers = bool(row[0])
+        if usa_tiers:
+            cur.close()
+            conn.close()
+            await query.answer("Confirme a consolidação das cartas.")
+            teclado = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Confirmar modo unitário", callback_data="catmgr|tiers_confirm")],
+                [InlineKeyboardButton("Cancelar", callback_data="catmgr|tiers_cancel")],
+            ])
+            await query.edit_message_text(
+                "⚠️ Ao desativar os tiers, cada personagem ficará com uma carta (priorizando Tier 1). "
+                "Cartas duplicadas serão removidas, inventários serão somados à carta mantida e trocas pendentes ligadas às cartas removidas serão canceladas. Continuar?",
+                reply_markup=teclado,
+            )
+            return CM_CAT_VIEW
+        cur.execute("UPDATE categorias SET usa_tiers = TRUE WHERE id = %s", (cat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Cinco tiers ativados.")
+        res = _montar_view_categoria(cat_id)
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_CAT_VIEW
+
+    if acao == "tiers_cancel":
+        await query.answer("Cancelado.")
+        res = _montar_view_categoria(context.user_data.get("cm_cat_id"))
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_CAT_VIEW
+
+    if acao == "tiers_confirm":
+        cat_id = context.user_data.get("cm_cat_id")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT usa_tiers FROM categorias WHERE id = %s FOR UPDATE", (cat_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            await query.answer("A categoria já está no modo unitário.", show_alert=True)
+            return CM_CAT_VIEW
+        consolidar_categoria_em_tier_unico(cur, cat_id)
+        cur.execute("UPDATE categorias SET usa_tiers = FALSE WHERE id = %s", (cat_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        await query.answer("Cartas consolidadas em um tier.")
+        res = _montar_view_categoria(cat_id)
+        await query.edit_message_text(res[0], reply_markup=res[1], parse_mode="HTML")
+        return CM_CAT_VIEW
 
     if acao == "new_sub":
         await query.answer()
@@ -4293,6 +4427,7 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /editsub <code>ID | NovoNome</code> — Atalho para renomear subcategoria\n\n"
         "<b>Giros & Equipe:</b>\n"
         "• /dargiros <code>qtd</code> (respondendo a alguém) ou <code>ID qtd</code>\n"
+        "• /deleteall — Zerar as cartas obtidas por todos (com confirmação)\n"
         "• /addadm <code>ID</code> (ou responda a alguém) — Adicionar admin\n"
         "• /remadm <code>ID</code> — Remover admin"
     )
@@ -4494,12 +4629,52 @@ async def cmd_del_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Carta não encontrada.")
 
+async def cmd_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await bloqueio_nao_admin(update):
+        return
+    teclado = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑️ Apagar coleções de todos", callback_data="deleteall|confirm"),
+            InlineKeyboardButton("Cancelar", callback_data="deleteall|cancel"),
+        ]
+    ])
+    await update.effective_message.reply_text(
+        "⚠️ Isso vai zerar as cartas obtidas por todos e cancelar as trocas pendentes. As cartas cadastradas e os giros permanecem. Confirmar?",
+        reply_markup=teclado,
+    )
+
+async def callback_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not eh_admin(query.from_user.id):
+        await query.answer("Apenas administradores podem fazer isso.", show_alert=True)
+        return
+    if query.data == "deleteall|cancel":
+        await query.answer("Cancelado.")
+        await query.edit_message_text("Operação cancelada; as coleções continuam intactas.")
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM inventario")
+    apagados = cur.rowcount
+    cur.execute("DELETE FROM trocas WHERE status = 'pendente'")
+    trocas_canceladas = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    await query.answer("Coleções zeradas.")
+    await query.edit_message_text(
+        f"✅ Coleções zeradas: {apagados} registros de inventário removidos e {trocas_canceladas} trocas pendentes canceladas. As cartas cadastradas continuam no catálogo."
+    )
+
 async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or await bloqueio_nao_admin(update):
         return
 
     reply = msg.reply_to_message
+    # CommandHandler.args can be empty for some group/topic updates; recover the text args.
+    args = context.args or (msg.text or msg.caption or "").split()[1:]
     # Ignora apenas o reply automático de cabeçalho de tópico em grupos com Fóruns
     eh_servico_topico = reply is not None and any(
         getattr(reply, attr, None) is not None
@@ -4518,19 +4693,19 @@ async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alvo_username = ""
 
     try:
-        if eh_reply_real and len(context.args) == 1:
+        if eh_reply_real and len(args) == 1:
             alvo = reply.from_user
             if not alvo or alvo.is_bot:
                 await msg.reply_text("⚠️ Responda à mensagem de um jogador válido (não de um bot).")
                 return
             alvo_id = alvo.id
             alvo_username = alvo.username or ""
-            qtd = int(context.args[0])
+            qtd = int(args[0])
             verificar_usuario(alvo_id, alvo_username)
 
-        elif len(context.args) >= 2:
-            qtd = int(context.args[-1])
-            alvo_str = " ".join(context.args[:-1]).strip()
+        elif len(args) >= 2:
+            qtd = int(args[-1])
+            alvo_str = " ".join(args[:-1]).strip()
 
             if alvo_str.isdigit():
                 alvo_id = int(alvo_str)
@@ -4725,7 +4900,7 @@ async def main():
         ],
         states={
             CM_HOME: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(cat\||new_cat$|home$|close$)")],
-            CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|new_sub$|del_cat$|sub\||home$|close$)")],
+            CM_CAT_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_cat$|toggle_tiers$|tiers_confirm$|tiers_cancel$|new_sub$|del_cat$|sub\||home$|close$)")],
             CM_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_nova_cat)],
             CM_REN_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, catmgr_receber_ren_cat)],
             CM_SUB_VIEW: [CallbackQueryHandler(catmgr_callback, pattern=r"^catmgr\|(ren_sub$|new_subsub$|del_sub$|subsub\||cat\||home$|close$)")],
@@ -4794,6 +4969,8 @@ async def main():
     app.add_handler(CommandHandler("editcat", cmd_edit_cat))
     app.add_handler(CommandHandler("editsub", cmd_edit_sub))
     app.add_handler(CommandHandler("delcarta", cmd_del_carta))
+    app.add_handler(CommandHandler("deleteall", cmd_deleteall))
+    app.add_handler(CallbackQueryHandler(callback_deleteall, pattern=r"^deleteall\|"))
     app.add_handler(CommandHandler("dargiros", cmd_dar_giros))
     app.add_handler(CommandHandler("addadm", cmd_add_adm))
     app.add_handler(CommandHandler("remadm", cmd_rem_adm))
