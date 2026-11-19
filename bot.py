@@ -73,6 +73,19 @@ CATALOGO_INICIAL = {
     ST_TIER,
 ) = range(9)
 
+# Estados do assistente /editcarta
+(
+    ED_MENU,
+    ED_NOME,
+    ED_CAT,
+    ED_NEW_CAT,
+    ED_ASK_SUB,
+    ED_SUB,
+    ED_NEW_SUB,
+    ED_MIDIA,
+    ED_TIER,
+) = range(9, 18)
+
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
 
@@ -112,6 +125,9 @@ def iniciar_banco():
             ultimo_reset TEXT
         );
         ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS apelido TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_apelido_unico
+            ON usuarios (LOWER(TRIM(apelido)))
+            WHERE apelido IS NOT NULL AND TRIM(apelido) <> '';
         CREATE TABLE IF NOT EXISTS cartas (
             id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
@@ -218,7 +234,7 @@ def obter_apelido(user_id: int, username: str = "") -> tuple[str, bool]:
     return f"Mixer #{str(user_id)[-4:]}", False
 
 def processar_imagem_carta(image_bytes: bytes, tier: int) -> io.BytesIO:
-    """Padroniza qualquer foto em 1080x1700 e aplica a moldura PNG do tier se existir."""
+    """Padroniza qualquer foto em 900x1200 (3:4) e aplica a moldura PNG do tier se existir."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     base = ImageOps.fit(img, (LARGURA_CARTA, ALTURA_CARTA), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
@@ -280,7 +296,7 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     verificar_usuario(user.id, user.username)
 
-    novo_apelido = " ".join(context.args).strip()
+    novo_apelido = " ".join(" ".join(context.args).split()).strip()
     if not novo_apelido:
         atual, _ = obter_apelido(user.id, user.username)
         await update.message.reply_text(
@@ -296,8 +312,33 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE usuarios SET apelido = %s WHERE user_id = %s", (novo_apelido, user.id))
-    conn.commit()
+
+    cur.execute(
+        "SELECT 1 FROM usuarios WHERE LOWER(TRIM(apelido)) = LOWER(%s) AND user_id != %s LIMIT 1",
+        (novo_apelido, user.id)
+    )
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ O apelido <b>{esc(novo_apelido)}</b> já está sendo usado por outro jogador. Escolha outro!",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        cur.execute("UPDATE usuarios SET apelido = %s WHERE user_id = %s", (novo_apelido, user.id))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        await update.message.reply_text(
+            f"⚠️ O apelido <b>{esc(novo_apelido)}</b> já está sendo usado por outro jogador. Escolha outro!",
+            parse_mode="HTML"
+        )
+        return
+
     cur.close()
     conn.close()
 
@@ -458,7 +499,6 @@ async def executar_sorteio(query, cat_id=None, sub_id=None):
         qtd_carta = 1
         cur.execute("INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, 1)", (user.id, carta_id))
 
-    # Quantas cartas diferentes desse personagem/artista o jogador possui vs total cadastrado
     cur.execute("""
         SELECT COUNT(DISTINCT c.tier)
         FROM inventario i
@@ -1228,7 +1268,7 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sent_msg = await query.message.reply_photo(
             photo=buf_out,
-            caption="🖼️ <i>Prévia final (1080×1700)</i>",
+            caption=f"🖼️ <i>Prévia final ({LARGURA_CARTA}×{ALTURA_CARTA})</i>",
             parse_mode="HTML"
         )
         final_file_id = sent_msg.photo[-1].file_id
@@ -1269,6 +1309,532 @@ async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ==========================================
+# ASSISTENTE INTERATIVO /editcarta (COM BOTÕES)
+# ==========================================
+def _carregar_carta_dict(carta_id: int) -> dict | None:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.id, c.nome, c.categoria_id, cat.nome, c.subcategoria_id, sub.nome,
+               c.tier, c.file_id, c.media_type
+        FROM cartas c
+        JOIN categorias cat ON c.categoria_id = cat.id
+        LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
+        WHERE c.id = %s
+    """, (carta_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "nome": row[1],
+        "cat_id": row[2],
+        "cat_nome": row[3],
+        "sub_id": row[4],
+        "sub_nome": row[5],
+        "tier": row[6],
+        "file_id": row[7],
+        "media_type": row[8],
+    }
+
+def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
+    t_cfg = TIERS_CONFIG[d["tier"]]
+    cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
+    local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
+    midia_label = "GIF" if d["media_type"] == "animation" else f"Foto ({LARGURA_CARTA}×{ALTURA_CARTA})"
+
+    texto = (
+        f"🛠️ <b>Editando Carta #{d['id']}</b>\n\n"
+        f"{t_cfg['emoji']} <b>Nome:</b> {esc(d['nome'])}\n"
+        f"💿 <b>Categoria:</b> {cat_codigo}. {local_str}\n"
+        f"💎 <b>Tier:</b> {t_cfg['nome']}\n"
+        f"🖼️ <b>Mídia:</b> {midia_label}\n\n"
+        f"Escolha o que deseja alterar:"
+    )
+
+    botoes = [
+        [
+            InlineKeyboardButton("✏️ Nome", callback_data="ed_op|nome"),
+            InlineKeyboardButton("📂 Categoria/Sub", callback_data="ed_op|cat"),
+        ],
+        [
+            InlineKeyboardButton("🖼️ Foto / GIF", callback_data="ed_op|midia"),
+            InlineKeyboardButton("💎 Tier", callback_data="ed_op|tier"),
+        ],
+        [
+            InlineKeyboardButton("✅ Salvar alterações", callback_data="ed_salvar"),
+            InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel"),
+        ],
+    ]
+    return texto, InlineKeyboardMarkup(botoes)
+
+async def ed_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["admin_id"] = update.effective_user.id
+
+    if context.args:
+        alvo_raw = context.args[0].replace("#", "").strip()
+        if alvo_raw.isdigit():
+            d = _carregar_carta_dict(int(alvo_raw))
+            if not d:
+                await update.message.reply_text("Carta não encontrada com esse ID.")
+                return ConversationHandler.END
+            context.user_data["ed_carta"] = d
+            texto, markup = _montar_menu_edicao(d)
+            await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+            return ED_MENU
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, nome, tier FROM cartas ORDER BY id DESC LIMIT 12")
+    ultimas = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    botoes = []
+    linha = []
+    for cid, cnome, ctier in ultimas:
+        emoji = TIERS_CONFIG[ctier]["emoji"]
+        linha.append(InlineKeyboardButton(f"#{cid} {cnome} {emoji}", callback_data=f"ed_pick|{cid}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="ed_cancel")])
+
+    await update.message.reply_text(
+        "🛠️ <b>Editar Carta</b>\n\nEscolha uma carta nos botões ou digite o <b>ID da carta</b>:",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
+    )
+    return ED_MENU
+
+async def ed_receber_id_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_MENU
+
+    alvo_raw = update.message.text.replace("#", "").strip()
+    if not alvo_raw.isdigit():
+        await update.message.reply_text("⚠️ Envie um <b>ID numérico</b> válido (ex: <code>15</code>) ou toque em um botão.", parse_mode="HTML")
+        return ED_MENU
+
+    d = _carregar_carta_dict(int(alvo_raw))
+    if not d:
+        await update.message.reply_text("⚠️ Carta não encontrada. Tente outro ID:")
+        return ED_MENU
+
+    context.user_data["ed_carta"] = d
+    texto, markup = _montar_menu_edicao(d)
+    await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_MENU
+
+    if query.data.startswith("ed_pick|"):
+        cid = int(query.data.split("|")[1])
+        d = _carregar_carta_dict(cid)
+        if not d:
+            await query.answer("Carta não encontrada.", show_alert=True)
+            return ED_MENU
+        await query.answer()
+        context.user_data["ed_carta"] = d
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    d = context.user_data.get("ed_carta")
+    if not d:
+        await query.answer("Sessão expirada. Use /editcarta novamente.", show_alert=True)
+        return ConversationHandler.END
+
+    if query.data == "ed_salvar":
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s AND id != %s", (d["nome"], d["tier"], d["id"]))
+        conflito = cur.fetchone()
+        if conflito:
+            cur.close()
+            conn.close()
+            await query.answer(f"Já existe outra carta de {d['nome']} no Tier {d['tier']} (#{conflito[0]})!", show_alert=True)
+            return ED_MENU
+
+        peso = TIERS_CONFIG[d["tier"]]["peso"]
+        cur.execute("""
+            UPDATE cartas
+            SET nome = %s, categoria_id = %s, subcategoria_id = %s, tier = %s,
+                peso_drop = %s, file_id = %s, media_type = %s
+            WHERE id = %s
+        """, (d["nome"], d["cat_id"], d["sub_id"], d["tier"], peso, d["file_id"], d["media_type"], d["id"]))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        await query.answer("Salvo!")
+        t_cfg = TIERS_CONFIG[d["tier"]]
+        cat_codigo = d["sub_id"] if d["sub_id"] else d["cat_id"]
+        local_str = f"{esc(d['cat_nome'])} • {esc(d['sub_nome'])}" if d["sub_nome"] else esc(d["cat_nome"])
+        await query.edit_message_text(
+            f"✅ <b>Carta #{d['id']} atualizada!</b>\n\n"
+            f"{t_cfg['emoji']} <b>{d['id']}. {esc(d['nome'])}.</b> <i>[{t_cfg['curto']}]</i>\n"
+            f"💿 <b>{cat_codigo}. {local_str}</b>",
+            parse_mode="HTML"
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    _, op = query.data.split("|")
+    await query.answer()
+
+    if op == "nome":
+        await query.edit_message_text(
+            f"✏️ Nome atual: <b>{esc(d['nome'])}</b>\n\nDigite o <b>novo nome</b> da carta:",
+            parse_mode="HTML"
+        )
+        return ED_NOME
+
+    if op == "cat":
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, nome FROM categorias ORDER BY id ASC")
+        cats = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        botoes = []
+        linha = []
+        for cid, cnome in cats:
+            linha.append(InlineKeyboardButton(cnome, callback_data=f"ed_cat|{cid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("➕ Criar nova categoria", callback_data="ed_new_cat")])
+        botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="ed_voltar")])
+
+        await query.edit_message_text(
+            "📂 Escolha a <b>nova categoria</b> ou crie uma:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return ED_CAT
+
+    if op == "midia":
+        await query.edit_message_text(
+            f"🖼️ Envie a <b>nova foto</b> (padronizada em {LARGURA_CARTA}×{ALTURA_CARTA}) ou <b>novo GIF</b> para a carta <b>#{d['id']}</b>:",
+            parse_mode="HTML"
+        )
+        return ED_MIDIA
+
+    if op == "tier":
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND id != %s", (d["nome"], d["id"]))
+        ocupados = {r[0] for r in cur.fetchall()}
+        cur.close()
+        conn.close()
+
+        botoes = []
+        for t in range(1, 6):
+            t_cfg = TIERS_CONFIG[t]
+            if t in ocupados:
+                botoes.append([InlineKeyboardButton(f"⛔ {t_cfg['nome']} (Já existe)", callback_data=f"ed_tlock|{t}")])
+            else:
+                marca = " (Atual)" if t == d["tier"] else ""
+                botoes.append([InlineKeyboardButton(f"{t_cfg['emoji']} {t_cfg['nome']}{marca}", callback_data=f"ed_tier|{t}")])
+        botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="ed_voltar")])
+
+        await query.edit_message_text(
+            f"💎 Escolha o novo <b>Tier</b> para <b>{esc(d['nome'])}</b>:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return ED_TIER
+
+    return ED_MENU
+
+async def ed_receber_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_NOME
+
+    novo_nome = update.message.text.strip()
+    if not novo_nome:
+        await update.message.reply_text("⚠️ Digite um nome válido.")
+        return ED_NOME
+
+    d = context.user_data["ed_carta"]
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s AND id != %s", (novo_nome, d["tier"], d["id"]))
+    conflito = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if conflito:
+        await update.message.reply_text(
+            f"⚠️ Já existe outra carta de <b>{esc(novo_nome)}</b> no Tier {d['tier']} (<code>#{conflito[0]}</code>).\n"
+            f"Digite outro nome:",
+            parse_mode="HTML"
+        )
+        return ED_NOME
+
+    d["nome"] = novo_nome
+    texto, markup = _montar_menu_edicao(d)
+    await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_CAT
+
+    d = context.user_data["ed_carta"]
+    await query.answer()
+
+    if query.data == "ed_voltar":
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    if query.data == "ed_new_cat":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova categoria</b>:", parse_mode="HTML")
+        return ED_NEW_CAT
+
+    cat_id = int(query.data.split("|")[1])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+    cat_nome = cur.fetchone()[0]
+    cur.execute("SELECT id, nome FROM subcategorias WHERE categoria_id = %s ORDER BY id ASC", (cat_id,))
+    subs = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    d["cat_id"] = cat_id
+    d["cat_nome"] = cat_nome
+
+    if subs:
+        botoes = []
+        linha = []
+        for sid, snome in subs:
+            linha.append(InlineKeyboardButton(snome, callback_data=f"ed_sub|{sid}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("➕ Criar nova subcategoria", callback_data="ed_new_sub")])
+        botoes.append([InlineKeyboardButton("➖ Sem subcategoria", callback_data="ed_sem_sub")])
+
+        await query.edit_message_text(
+            f"📂 Categoria: <b>{esc(cat_nome)}</b>\nEscolha a <b>subcategoria</b>:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML"
+        )
+        return ED_SUB
+
+    d["sub_id"] = None
+    d["sub_nome"] = None
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_receber_nova_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_NEW_CAT
+
+    nome_cat = update.message.text.strip()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, nome FROM categorias WHERE LOWER(nome) = LOWER(%s)", (nome_cat,))
+    existente = cur.fetchone()
+    if existente:
+        cat_id, cat_oficial = existente
+    else:
+        cur.execute("INSERT INTO categorias (nome) VALUES (%s) RETURNING id", (nome_cat,))
+        cat_id = cur.fetchone()[0]
+        cat_oficial = nome_cat
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    d = context.user_data["ed_carta"]
+    d["cat_id"] = cat_id
+    d["cat_nome"] = cat_oficial
+
+    botoes = [
+        [InlineKeyboardButton("➕ Criar subcategoria", callback_data="ed_sub_sim")],
+        [InlineKeyboardButton("➡️ Sem subcategoria", callback_data="ed_sub_nao")],
+    ]
+    await update.message.reply_text(
+        f"✅ Categoria <b>{esc(cat_oficial)}</b> selecionada. Vai ter subcategoria?",
+        reply_markup=InlineKeyboardMarkup(botoes),
+        parse_mode="HTML"
+    )
+    return ED_ASK_SUB
+
+async def ed_decidir_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_ASK_SUB
+
+    await query.answer()
+    if query.data == "ed_sub_sim":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova subcategoria</b>:", parse_mode="HTML")
+        return ED_NEW_SUB
+
+    d = context.user_data["ed_carta"]
+    d["sub_id"] = None
+    d["sub_nome"] = None
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_escolher_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_SUB
+
+    d = context.user_data["ed_carta"]
+    await query.answer()
+
+    if query.data == "ed_new_sub":
+        await query.edit_message_text("✏️ Digite o <b>nome da nova subcategoria</b>:", parse_mode="HTML")
+        return ED_NEW_SUB
+
+    if query.data == "ed_sem_sub":
+        d["sub_id"] = None
+        d["sub_nome"] = None
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    sub_id = int(query.data.split("|")[1])
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT nome FROM subcategorias WHERE id = %s", (sub_id,))
+    sub_nome = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+
+    d["sub_id"] = sub_id
+    d["sub_nome"] = sub_nome
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_receber_nova_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_NEW_SUB
+
+    sub_nome = update.message.text.strip()
+    d = context.user_data["ed_carta"]
+    cat_id = d["cat_id"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, nome FROM subcategorias WHERE categoria_id = %s AND LOWER(nome) = LOWER(%s)",
+        (cat_id, sub_nome)
+    )
+    existente = cur.fetchone()
+    if existente:
+        sub_id, sub_oficial = existente
+    else:
+        cur.execute(
+            "INSERT INTO subcategorias (categoria_id, nome) VALUES (%s, %s) RETURNING id",
+            (cat_id, sub_nome)
+        )
+        sub_id = cur.fetchone()[0]
+        sub_oficial = sub_nome
+        conn.commit()
+    cur.close()
+    conn.close()
+
+    d["sub_id"] = sub_id
+    d["sub_nome"] = sub_oficial
+    texto, markup = _montar_menu_edicao(d)
+    await update.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != context.user_data.get("admin_id"):
+        return ED_MIDIA
+
+    msg = update.message
+    d = context.user_data["ed_carta"]
+
+    if msg.animation:
+        d["file_id"] = msg.animation.file_id
+        d["media_type"] = "animation"
+    elif msg.photo or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/")):
+        raw_id = msg.photo[-1].file_id if msg.photo else msg.document.file_id
+        tg_file = await context.bot.get_file(raw_id)
+        buf_in = io.BytesIO()
+        await tg_file.download_to_memory(buf_in)
+        buf_out = processar_imagem_carta(buf_in.getvalue(), d["tier"])
+        sent_msg = await msg.reply_photo(
+            photo=buf_out,
+            caption=f"🖼️ <i>Nova mídia ({LARGURA_CARTA}×{ALTURA_CARTA})</i>",
+            parse_mode="HTML"
+        )
+        d["file_id"] = sent_msg.photo[-1].file_id
+        d["media_type"] = "photo"
+    else:
+        await msg.reply_text("⚠️ Envie uma <b>foto</b> ou <b>GIF</b> válido.", parse_mode="HTML")
+        return ED_MIDIA
+
+    texto, markup = _montar_menu_edicao(d)
+    await msg.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != context.user_data.get("admin_id"):
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ED_TIER
+
+    if query.data.startswith("ed_tlock"):
+        await query.answer("Esse Tier já existe para esse nome!", show_alert=True)
+        return ED_TIER
+
+    d = context.user_data["ed_carta"]
+    await query.answer()
+
+    if query.data == "ed_voltar":
+        texto, markup = _montar_menu_edicao(d)
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return ED_MENU
+
+    novo_tier = int(query.data.split("|")[1])
+    d["tier"] = novo_tier
+    texto, markup = _montar_menu_edicao(d)
+    await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+    return ED_MENU
+
+async def ed_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer("Cancelado.")
+        await update.callback_query.edit_message_text("❌ Edição cancelada.")
+    else:
+        await update.message.reply_text("❌ Edição cancelada.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ==========================================
 # COMANDOS EXCLUSIVOS DE ADMIN (/studio)
 # ==========================================
 async def bloqueio_nao_admin(update: Update) -> bool:
@@ -1280,8 +1846,8 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = (
         "🎛️ <b>Ecco-Mix Studio (Painel Admin)</b>\n\n"
         "<b>Criar & Gerenciar Cartas:</b>\n"
-        "• /addcarta — Assistente interativo com botões (Categoria → Subcategoria → Nome → Foto 1080×1700 → Tier)\n"
-        "• /editcarta <code>ID | Nome | Categoria | Subcategoria | Tier</code> — Editar carta (use <code>-</code> sem subcategoria)\n"
+        f"• /addcarta — Assistente interativo com botões (Categoria → Subcategoria → Nome → Foto {LARGURA_CARTA}×{ALTURA_CARTA} → Tier)\n"
+        "• /editcarta (ou <code>/editcarta ID</code>) — Assistente com botões para editar Nome, Categoria, Foto/GIF ou Tier\n"
         "• /delcarta <code>ID</code> — Excluir uma carta\n\n"
         "<b>Molduras PNG por Tier (Opcional):</b>\n"
         "• /moldura <code>1 a 5</code> — Responda a um arquivo <b>.PNG transparente</b> para definir a moldura daquele Tier\n"
@@ -1373,7 +1939,7 @@ async def cmd_status_molduras(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     linhas = ["🖼️ <b>Status das Molduras PNG</b>\n"]
     for t in range(1, 6):
-        status = "✅ Moldura PNG ativa" if t in ativas else "➖ Sem moldura (apenas 1080×1700)"
+        status = "✅ Moldura PNG ativa" if t in ativas else f"➖ Sem moldura (apenas {LARGURA_CARTA}×{ALTURA_CARTA})"
         linhas.append(f"• <b>{TIERS_CONFIG[t]['nome']}:</b> {status}")
 
     await update.message.reply_text("\n".join(linhas), parse_mode="HTML")
@@ -1448,92 +2014,6 @@ async def cmd_edit_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Subcategoria <code>{sid}</code> renomeada para <b>{esc(novo_nome)}</b>.", parse_mode="HTML")
     else:
         await update.message.reply_text("ID de subcategoria não encontrado.")
-
-async def cmd_edit_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await bloqueio_nao_admin(update):
-        return
-
-    partes = [p.strip() for p in " ".join(context.args).split("|")]
-    if len(partes) != 5 or not partes[0].replace("#", "").isdigit():
-        await update.message.reply_text(
-            "Uso: <code>/editcarta ID | NovoNome | Categoria | Subcategoria | Tier</code>\n"
-            "(Use <code>-</code> na Subcategoria se não houver.)",
-            parse_mode="HTML"
-        )
-        return
-
-    cid = int(partes[0].replace("#", ""))
-    novo_nome, cat_nome, sub_nome, tier_str = partes[1], partes[2], partes[3], partes[4]
-
-    if not tier_str.isdigit() or int(tier_str) not in TIERS_CONFIG:
-        await update.message.reply_text("O Tier deve ser de <b>1 a 5</b>.", parse_mode="HTML")
-        return
-    tier = int(tier_str)
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT file_id, media_type FROM cartas WHERE id = %s", (cid,))
-    atual = cur.fetchone()
-    if not atual:
-        await update.message.reply_text("Carta não encontrada.")
-        cur.close()
-        conn.close()
-        return
-
-    cur.execute("SELECT id FROM categorias WHERE LOWER(nome) = LOWER(%s)", (cat_nome,))
-    cat = cur.fetchone()
-    if not cat:
-        await update.message.reply_text("Categoria não encontrada.")
-        cur.close()
-        conn.close()
-        return
-    cat_id = cat[0]
-
-    sub_id = None
-    if sub_nome != "-":
-        cur.execute("SELECT id FROM subcategorias WHERE categoria_id = %s AND LOWER(nome) = LOWER(%s)", (cat_id, sub_nome))
-        sub = cur.fetchone()
-        if not sub:
-            await update.message.reply_text("Subcategoria não encontrada nessa categoria.")
-            cur.close()
-            conn.close()
-            return
-        sub_id = sub[0]
-
-    cur.execute("SELECT id FROM cartas WHERE LOWER(nome) = LOWER(%s) AND tier = %s AND id != %s", (novo_nome, tier, cid))
-    conflito = cur.fetchone()
-    if conflito:
-        await update.message.reply_text(f"⚠️ Já existe outra carta de <b>{esc(novo_nome)}</b> no Tier {tier} (<code>#{conflito[0]}</code>).", parse_mode="HTML")
-        cur.close()
-        conn.close()
-        return
-
-    file_id, media_type = atual
-    reply = update.message.reply_to_message
-    if reply:
-        if reply.animation:
-            file_id = reply.animation.file_id
-            media_type = "animation"
-        elif reply.photo:
-            tg_file = await context.bot.get_file(reply.photo[-1].file_id)
-            buf_in = io.BytesIO()
-            await tg_file.download_to_memory(buf_in)
-            buf_out = processar_imagem_carta(buf_in.getvalue(), tier)
-            sent_msg = await update.message.reply_photo(photo=buf_out)
-            file_id = sent_msg.photo[-1].file_id
-            media_type = "photo"
-
-    peso = TIERS_CONFIG[tier]["peso"]
-    cur.execute("""
-        UPDATE cartas
-        SET nome = %s, categoria_id = %s, subcategoria_id = %s, tier = %s, peso_drop = %s, file_id = %s, media_type = %s
-        WHERE id = %s
-    """, (novo_nome, cat_id, sub_id, tier, peso, file_id, media_type, cid))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    await update.message.reply_text(f"✅ Carta <code>#{cid}</code> atualizada com sucesso!", parse_mode="HTML")
 
 async def cmd_del_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
@@ -1662,6 +2142,33 @@ async def main():
     )
     app.add_handler(conv_carta)
 
+    # Assistente interativo /editcarta
+    conv_edit_carta = ConversationHandler(
+        entry_points=[CommandHandler("editcarta", ed_start)],
+        states={
+            ED_MENU: [
+                CallbackQueryHandler(ed_menu_callback, pattern=r"^ed_(pick\||op\||salvar$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_id_texto),
+            ],
+            ED_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nome)],
+            ED_CAT: [CallbackQueryHandler(ed_escolher_cat, pattern=r"^ed_(cat\||new_cat$|voltar$)")],
+            ED_NEW_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nova_cat)],
+            ED_ASK_SUB: [CallbackQueryHandler(ed_decidir_sub, pattern=r"^ed_sub_(sim|nao)$")],
+            ED_SUB: [CallbackQueryHandler(ed_escolher_sub, pattern=r"^ed_(sub\||new_sub$|sem_sub$)")],
+            ED_NEW_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nova_sub)],
+            ED_MIDIA: [MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.ANIMATION, ed_receber_midia)],
+            ED_TIER: [CallbackQueryHandler(ed_escolher_tier, pattern=r"^ed_(tier\||tlock\||voltar$)")],
+        },
+        fallbacks=[
+            CommandHandler("cancelar", ed_cancel),
+            CallbackQueryHandler(ed_cancel, pattern=r"^ed_cancel$"),
+        ],
+        allow_reentry=True,
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(conv_edit_carta)
+
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
@@ -1680,7 +2187,6 @@ async def main():
     app.add_handler(CommandHandler("listacat", cmd_lista_cat))
     app.add_handler(CommandHandler("editcat", cmd_edit_cat))
     app.add_handler(CommandHandler("editsub", cmd_edit_sub))
-    app.add_handler(CommandHandler("editcarta", cmd_edit_carta))
     app.add_handler(CommandHandler("delcarta", cmd_del_carta))
     app.add_handler(CommandHandler("dargiros", cmd_dar_giros))
     app.add_handler(CommandHandler("addadm", cmd_add_adm))
