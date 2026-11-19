@@ -1,4 +1,4 @@
 python-telegram-bot==21.6
-psycopg2-binary2.9.9
-aiohttp3.10.10
-Pillow10.4.0
+psycopg2-binary==2.9.9
+aiohttp==3.10.10
+Pillow==10.4.0
