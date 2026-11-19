@@ -8,7 +8,8 @@ import asyncio
 from collections import Counter
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool, PoolError
-from datetime import date
+from datetime import date, datetime, time as datetime_time, timedelta
+from zoneinfo import ZoneInfo
 from aiohttp import web
 from PIL import Image, ImageOps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -36,6 +37,7 @@ if env_admins:
     SUPER_ADMINS.extend([int(x.strip()) for x in env_admins.split(",") if x.strip().isdigit()])
 
 GIROS_DIARIOS = 10
+FUSO_GIROS = ZoneInfo("America/Sao_Paulo")
 LARGURA_CARTA = 900
 ALTURA_CARTA = 1200
 ED_PAGE_SIZE = 10
@@ -203,6 +205,8 @@ CATALOGO_INICIAL = {
     TX_TIER_EDIT,
 ) = range(34, 40)
 
+MV_ARTIST_NAME = 40
+
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
 
@@ -234,36 +238,78 @@ def formatar_local_carta(
     return cat_codigo, " • ".join(partes)
 
 def extrair_html_com_custom_emojis(message) -> str:
-    """Converte o texto (ou legenda) da mensagem do admin em HTML preservando Emojis Premium (<tg-emoji>)."""
+    """Converte entidades de formatação do Telegram em HTML aceito pelo Bot API."""
     texto = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or []
     if not texto:
         return ""
-
-    utf16_bytes = texto.encode("utf-16-le")
-    custom_spans = []
-    for ent in entities:
-        if ent.type == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
-            start_byte = ent.offset * 2
-            end_byte = (ent.offset + ent.length) * 2
-            custom_spans.append((start_byte, end_byte, ent.custom_emoji_id))
-
-    if not custom_spans:
+    if not entities:
         return texto
 
-    custom_spans.sort(key=lambda x: x[0])
+    utf16_bytes = texto.encode("utf-16-le")
+    total_bytes = len(utf16_bytes)
+    eventos = {}
+
+    for ent in entities:
+        inicio = max(0, min(total_bytes, ent.offset * 2))
+        fim = max(inicio, min(total_bytes, (ent.offset + ent.length) * 2))
+        tipo = ent.type
+        abre = fecha = None
+        if tipo == "bold":
+            abre, fecha = "<b>", "</b>"
+        elif tipo == "italic":
+            abre, fecha = "<i>", "</i>"
+        elif tipo == "underline":
+            abre, fecha = "<u>", "</u>"
+        elif tipo == "strikethrough":
+            abre, fecha = "<s>", "</s>"
+        elif tipo == "spoiler":
+            abre, fecha = "<tg-spoiler>", "</tg-spoiler>"
+        elif tipo == "blockquote":
+            abre, fecha = "<blockquote>", "</blockquote>"
+        elif tipo == "expandable_blockquote":
+            abre, fecha = "<blockquote expandable>", "</blockquote>"
+        elif tipo == "code":
+            abre, fecha = "<code>", "</code>"
+        elif tipo == "pre":
+            language = getattr(ent, "language", "") or ""
+            if language:
+                abre = f'<pre><code class="language-{html.escape(language, quote=True)}">'
+                fecha = "</code></pre>"
+            else:
+                abre, fecha = "<pre>", "</pre>"
+        elif tipo == "text_link" and getattr(ent, "url", None):
+            abre = f'<a href="{html.escape(ent.url, quote=True)}">'
+            fecha = "</a>"
+        elif tipo == "text_mention" and getattr(ent, "user", None):
+            abre = f'<a href="tg://user?id={int(ent.user.id)}">'
+            fecha = "</a>"
+        elif tipo in ("url", "email"):
+            valor = utf16_bytes[inicio:fim].decode("utf-16-le", errors="replace")
+            href = f"mailto:{valor}" if tipo == "email" else valor
+            abre = f'<a href="{html.escape(href, quote=True)}">'
+            fecha = "</a>"
+        elif tipo == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            abre = f'<tg-emoji emoji-id="{html.escape(str(ent.custom_emoji_id), quote=True)}">'
+            fecha = "</tg-emoji>"
+
+        if abre is not None:
+            tamanho = fim - inicio
+            eventos.setdefault(inicio, {"fecha": [], "abre": []})["abre"].append((tamanho, abre))
+            eventos.setdefault(fim, {"fecha": [], "abre": []})["fecha"].append((tamanho, fecha))
+
     partes = []
     cursor = 0
-    for start_b, end_b, emoji_id in custom_spans:
-        if start_b > cursor:
-            partes.append(utf16_bytes[cursor:start_b].decode("utf-16-le"))
-        emoji_char = utf16_bytes[start_b:end_b].decode("utf-16-le")
-        partes.append(f'<tg-emoji emoji-id="{esc(emoji_id)}">{esc(emoji_char)}</tg-emoji>')
-        cursor = end_b
-
-    if cursor < len(utf16_bytes):
-        partes.append(utf16_bytes[cursor:].decode("utf-16-le"))
-
+    for pos in sorted(eventos):
+        if pos > cursor:
+            partes.append(html.escape(utf16_bytes[cursor:pos].decode("utf-16-le", errors="replace"), quote=False))
+        evento = eventos[pos]
+        # Feche primeiro o intervalo mais interno e abra primeiro o maior.
+        partes.extend(tag for _, tag in sorted(evento["fecha"], key=lambda item: item[0]))
+        partes.extend(tag for _, tag in sorted(evento["abre"], key=lambda item: item[0], reverse=True))
+        cursor = pos
+    if cursor < total_bytes:
+        partes.append(html.escape(utf16_bytes[cursor:].decode("utf-16-le", errors="replace"), quote=False))
     return "".join(partes)
 
 # ==========================================
@@ -559,37 +605,72 @@ def eh_admin(user_id: int) -> bool:
     conn.close()
     return achou
 
+def _hoje_sao_paulo() -> date:
+    return datetime.now(FUSO_GIROS).date()
+
+def _dias_desde_reposicao(ultimo_reset, hoje: date) -> int:
+    try:
+        ultima_data = date.fromisoformat(str(ultimo_reset))
+    except (TypeError, ValueError):
+        return 1
+    return max(0, (hoje - ultima_data).days)
+
+def repor_giros_diarios():
+    """Adds one daily allotment at São Paulo midnight, catching up missed dates."""
+    hoje = _hoje_sao_paulo()
+    hoje_txt = hoje.isoformat()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, ultimo_reset FROM usuarios WHERE ultimo_reset IS DISTINCT FROM %s FOR UPDATE",
+        (hoje_txt,),
+    )
+    for user_id, ultimo_reset in cur.fetchall():
+        dias = _dias_desde_reposicao(ultimo_reset, hoje)
+        if dias:
+            cur.execute(
+                "UPDATE usuarios SET giros_restantes = COALESCE(giros_restantes, 0) + %s, ultimo_reset = %s WHERE user_id = %s",
+                (dias * GIROS_DIARIOS, hoje_txt, user_id),
+            )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+async def loop_reposicao_diaria():
+    while True:
+        agora = datetime.now(FUSO_GIROS)
+        amanha = agora.date() + timedelta(days=1)
+        meia_noite = datetime.combine(amanha, datetime_time.min, tzinfo=FUSO_GIROS)
+        await asyncio.sleep(max(1, (meia_noite - agora).total_seconds()))
+        try:
+            await asyncio.to_thread(repor_giros_diarios)
+        except Exception as e:
+            print(f"⚠️ Falha ao repor giros diários: {e}", flush=True)
+
 def verificar_usuario(user_id: int, username: str = "") -> int:
     conn = get_db()
     cur = conn.cursor()
-    hoje = str(date.today())
+    hoje_data = _hoje_sao_paulo()
+    hoje = hoje_data.isoformat()
     username_limpo = (username or "").lstrip("@").lower()
 
-    cur.execute("SELECT giros_restantes, ultimo_reset, username FROM usuarios WHERE user_id = %s", (user_id,))
+    cur.execute(
+        "INSERT INTO usuarios (user_id, username, giros_restantes, ultimo_reset) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+        (user_id, username_limpo, GIROS_DIARIOS, hoje),
+    )
+    cur.execute("SELECT giros_restantes, ultimo_reset, username FROM usuarios WHERE user_id = %s FOR UPDATE", (user_id,))
     row = cur.fetchone()
-
-    if not row:
+    giros, ultimo_reset, uname_atual = row
+    if username_limpo and username_limpo != (uname_atual or ""):
+        cur.execute("UPDATE usuarios SET username = %s WHERE user_id = %s", (username_limpo, user_id))
+    dias = _dias_desde_reposicao(ultimo_reset, hoje_data)
+    if dias:
+        giros = (giros or 0) + dias * GIROS_DIARIOS
         cur.execute(
-            "INSERT INTO usuarios (user_id, username, giros_restantes, ultimo_reset) VALUES (%s, %s, %s, %s)",
-            (user_id, username_limpo, GIROS_DIARIOS, hoje)
+            "UPDATE usuarios SET giros_restantes = %s, ultimo_reset = %s WHERE user_id = %s",
+            (giros, hoje, user_id),
         )
-        giros = GIROS_DIARIOS
-        conn.commit()
-    else:
-        giros, ultimo_reset, uname_atual = row
-        precisa_update = False
-        if username_limpo and username_limpo != (uname_atual or ""):
-            cur.execute("UPDATE usuarios SET username = %s WHERE user_id = %s", (username_limpo, user_id))
-            precisa_update = True
-        if ultimo_reset != hoje:
-            giros = GIROS_DIARIOS
-            cur.execute(
-                "UPDATE usuarios SET giros_restantes = %s, ultimo_reset = %s WHERE user_id = %s",
-                (GIROS_DIARIOS, hoje, user_id)
-            )
-            precisa_update = True
-        if precisa_update:
-            conn.commit()
+    conn.commit()
 
     cur.close()
     conn.close()
@@ -3597,7 +3678,7 @@ def _montar_view_categoria(cat_id: int) -> tuple[str, InlineKeyboardMarkup] | No
     return "\n".join(linhas), InlineKeyboardMarkup(botoes)
 
 def consolidar_categoria_em_tier_unico(cur, cat_id: int):
-    """Keep one card per character, preferring Tier 1, and merge owned quantities."""
+    """Keep one card per character; deleting the others also deletes their inventories."""
     cur.execute(
         "SELECT id, nome, tier FROM cartas WHERE categoria_id = %s ORDER BY LOWER(nome), tier, id",
         (cat_id,),
@@ -3611,29 +3692,6 @@ def consolidar_categoria_em_tier_unico(cur, cat_id: int):
         for carta_id, _, _ in cartas_nome:
             if carta_id == keeper_id:
                 continue
-            cur.execute(
-                "SELECT user_id, SUM(quantidade) FROM inventario WHERE carta_id = %s GROUP BY user_id",
-                (carta_id,),
-            )
-            for user_id, quantidade in cur.fetchall():
-                cur.execute(
-                    "SELECT id, quantidade FROM inventario WHERE user_id = %s AND carta_id = %s ORDER BY id",
-                    (user_id, keeper_id),
-                )
-                registros = cur.fetchall()
-                if registros:
-                    cur.execute(
-                        "UPDATE inventario SET quantidade = %s WHERE id = %s",
-                        (sum(q for _, q in registros) + quantidade, registros[0][0]),
-                    )
-                    extras = [row_id for row_id, _ in registros[1:]]
-                    if extras:
-                        cur.execute("DELETE FROM inventario WHERE id = ANY(%s)", (extras,))
-                else:
-                    cur.execute(
-                        "INSERT INTO inventario (user_id, carta_id, quantidade) VALUES (%s, %s, %s)",
-                        (user_id, keeper_id, quantidade),
-                    )
             cur.execute("DELETE FROM trocas WHERE status = 'pendente' AND (carta_oferecida_id = %s OR carta_pedida_id = %s)", (carta_id, carta_id))
             cur.execute("DELETE FROM cartas WHERE id = %s", (carta_id,))
 
@@ -3816,7 +3874,7 @@ async def catmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             await query.edit_message_text(
                 "⚠️ Ao desativar os tiers, cada personagem ficará com uma carta (priorizando Tier 1). "
-                "Cartas duplicadas serão removidas, inventários serão somados à carta mantida e trocas pendentes ligadas às cartas removidas serão canceladas. Continuar?",
+                "As cartas duplicadas serão removidas junto com seus dados de coleção, e trocas pendentes ligadas a elas serão canceladas. Continuar?",
                 reply_markup=teclado,
             )
             return CM_CAT_VIEW
@@ -4442,6 +4500,7 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📜 Catálogo", callback_data="studio_go|catalogo"),
+            InlineKeyboardButton("📦 Mover artista/personagem", callback_data="studio_go|moverartista"),
         ],
     ]
     await update.effective_message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
@@ -4666,6 +4725,345 @@ async def callback_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         f"✅ Coleções zeradas: {apagados} registros de inventário removidos e {trocas_canceladas} trocas pendentes canceladas. As cartas cadastradas continuam no catálogo."
     )
+
+async def cmd_moverartista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or await bloqueio_nao_admin(update):
+        return
+    nome = " ".join(context.args).strip()
+    if not nome:
+        await msg.reply_text("Informe o nome do artista/personagem. Você também pode iniciar pelo botão no Studio.", parse_mode="HTML")
+        return
+
+    await iniciar_movimento_artista(msg, update.effective_user.id, context, nome)
+
+async def iniciar_movimento_artista(msg, user_id: int, context: ContextTypes.DEFAULT_TYPE, nome: str):
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome, subsub.nome
+        FROM cartas c
+        JOIN categorias cat ON cat.id = c.categoria_id
+        LEFT JOIN subcategorias sub ON sub.id = c.subcategoria_id
+        LEFT JOIN subsubcategorias subsub ON subsub.id = c.subsubcategoria_id
+        WHERE LOWER(TRIM(c.nome)) = LOWER(TRIM(%s))
+        ORDER BY c.tier, c.id
+    """, (nome,))
+    cartas = cur.fetchall()
+    cur.close()
+    conn.close()
+    if not cartas:
+        await msg.reply_text(f"Não encontrei cartas cadastradas com o nome <b>{esc(nome)}</b>.", parse_mode="HTML")
+        return
+
+    context.user_data["mv_artist_admin"] = user_id
+    context.user_data["mv_artist_chat"] = msg.chat_id
+    context.user_data["mv_artist_name"] = cartas[0][1]
+    context.user_data["mv_artist_ids"] = [row[0] for row in cartas]
+    context.user_data["mv_artist_tiers"] = sorted({row[2] for row in cartas})
+    caminhos = sorted({" / ".join(x for x in row[3:] if x) for row in cartas})
+    resumo = (
+        f"📦 <b>{esc(cartas[0][1])}</b>: {len(cartas)} carta(s), "
+        f"tiers {', '.join(str(t) for t in context.user_data['mv_artist_tiers'])}\n"
+        f"Local atual: {esc('; '.join(caminhos))}\n\nEscolha a categoria de destino:"
+    )
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, nome FROM categorias ORDER BY nome")
+    categorias = cur.fetchall()
+    cur.close()
+    conn.close()
+    botoes = []
+    linha = []
+    for cat_id, cat_nome in categorias:
+        linha.append(InlineKeyboardButton(cat_nome[:50], callback_data=f"mvartist|cat|{cat_id}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    botoes.append([InlineKeyboardButton("Cancelar", callback_data="mvartist|cancel")])
+    await msg.reply_text(resumo, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
+
+async def studio_moverartista_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not eh_admin(query.from_user.id):
+        await query.answer("Apenas administradores podem mover cartas.", show_alert=True)
+        return ConversationHandler.END
+    context.user_data.clear()
+    context.user_data["mv_artist_admin"] = query.from_user.id
+    context.user_data["mv_artist_chat"] = query.message.chat_id
+    texto, markup = _montar_lista_artistas_mover(0)
+    await query.answer()
+    await query.message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
+    return MV_ARTIST_NAME
+
+def _montar_lista_artistas_mover(page: int):
+    page_size = 12
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(DISTINCT LOWER(TRIM(nome))) FROM cartas")
+    total = cur.fetchone()[0]
+    total_paginas = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_paginas - 1))
+    cur.execute("""
+        SELECT MIN(id), MIN(nome), COUNT(*)
+        FROM cartas
+        GROUP BY LOWER(TRIM(nome))
+        ORDER BY LOWER(MIN(nome))
+        LIMIT %s OFFSET %s
+    """, (page_size, page * page_size))
+    artistas = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    botoes = []
+    linha = []
+    for carta_id, nome, qtd in artistas:
+        linha.append(InlineKeyboardButton(f"{nome[:42]} ({qtd})", callback_data=f"mvlist|pick|{carta_id}"))
+        if len(linha) == 2:
+            botoes.append(linha)
+            linha = []
+    if linha:
+        botoes.append(linha)
+    if total_paginas > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"mvlist|page|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_paginas}", callback_data="mvlist|noop"))
+        if page + 1 < total_paginas:
+            nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"mvlist|page|{page + 1}"))
+        botoes.append(nav)
+    botoes.append([InlineKeyboardButton("Cancelar", callback_data="mvlist|cancel")])
+    texto = "📦 <b>Mover artista/personagem</b>\n\nEscolha nas cartas quem deseja mover:"
+    return texto, InlineKeyboardMarkup(botoes)
+
+async def studio_moverartista_lista_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not eh_admin(query.from_user.id) or context.user_data.get("mv_artist_admin") != query.from_user.id:
+        await query.answer("Esse menu pertence a outro admin.", show_alert=True)
+        return ConversationHandler.END
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "cancel":
+        await query.answer("Cancelado.")
+        await query.edit_message_text("Movimentação cancelada.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    if acao == "noop":
+        await query.answer()
+        return MV_ARTIST_NAME
+    if acao == "page":
+        texto, markup = _montar_lista_artistas_mover(int(partes[2]))
+        await query.answer()
+        await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return MV_ARTIST_NAME
+    if acao == "pick":
+        carta_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM cartas WHERE id = %s", (carta_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            await query.answer("Essa carta não existe mais.", show_alert=True)
+            return MV_ARTIST_NAME
+        await query.answer("Artista selecionado.")
+        await query.edit_message_text(f"Artista selecionado: <b>{esc(row[0])}</b>", parse_mode="HTML")
+        await iniciar_movimento_artista(query.message, query.from_user.id, context, row[0])
+        return ConversationHandler.END
+    await query.answer()
+    return MV_ARTIST_NAME
+
+async def studio_moverartista_receber_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not eh_admin(update.effective_user.id):
+        return ConversationHandler.END
+    nome = (update.effective_message.text or "").strip()
+    if not nome:
+        await update.effective_message.reply_text("Digite um nome válido ou use /cancelar.")
+        return MV_ARTIST_NAME
+    await iniciar_movimento_artista(update.effective_message, update.effective_user.id, context, nome)
+    return ConversationHandler.END
+
+async def studio_moverartista_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("Movimentação cancelada.")
+    return ConversationHandler.END
+
+async def callback_moverartista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not eh_admin(query.from_user.id):
+        await query.answer("Apenas administradores podem mover cartas.", show_alert=True)
+        return
+    if (
+        context.user_data.get("mv_artist_admin") != query.from_user.id
+        or context.user_data.get("mv_artist_chat") != query.message.chat_id
+    ):
+        await query.answer("Esse menu expirou. Use /moverartista novamente.", show_alert=True)
+        return
+
+    partes = query.data.split("|")
+    acao = partes[1]
+    if acao == "cancel":
+        context.user_data.pop("mv_artist_name", None)
+        context.user_data.pop("mv_artist_ids", None)
+        context.user_data.pop("mv_artist_tiers", None)
+        context.user_data.pop("mv_artist_admin", None)
+        context.user_data.pop("mv_artist_chat", None)
+        await query.answer("Movimentação cancelada.")
+        await query.edit_message_text("Movimentação cancelada.")
+        return
+
+    if acao == "cat":
+        cat_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
+        categoria = cur.fetchone()
+        cur.execute("SELECT id, nome FROM subcategorias WHERE categoria_id = %s ORDER BY nome", (cat_id,))
+        subs = cur.fetchall()
+        cur.close()
+        conn.close()
+        if not categoria:
+            await query.answer("Categoria não encontrada.", show_alert=True)
+            return
+        context.user_data["mv_artist_cat"] = cat_id
+        context.user_data["mv_artist_cat_name"] = categoria[0]
+        botoes = []
+        linha = []
+        for sub_id, sub_nome in subs:
+            linha.append(InlineKeyboardButton(sub_nome[:50], callback_data=f"mvartist|sub|{sub_id}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("Mover direto para a categoria", callback_data="mvartist|no_sub")])
+        botoes.append([InlineKeyboardButton("Cancelar", callback_data="mvartist|cancel")])
+        await query.answer()
+        await query.edit_message_text(
+            f"Destino: <b>{esc(categoria[0])}</b>. Escolha uma subcategoria ou mova direto para a categoria:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML",
+        )
+        return
+
+    if acao == "sub":
+        sub_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM subcategorias WHERE id = %s AND categoria_id = %s", (sub_id, context.user_data.get("mv_artist_cat")))
+        sub = cur.fetchone()
+        cur.execute("SELECT id, nome FROM subsubcategorias WHERE subcategoria_id = %s ORDER BY nome", (sub_id,))
+        grupos = cur.fetchall()
+        cur.close()
+        conn.close()
+        if not sub:
+            await query.answer("Subcategoria inválida para esta categoria.", show_alert=True)
+            return
+        context.user_data["mv_artist_sub"] = sub_id
+        if not grupos:
+            await query.answer("Destino selecionado.")
+            await _salvar_movimento_artista(query, context, sub_id=sub_id)
+            return
+        botoes = []
+        linha = []
+        for grupo_id, grupo_nome in grupos:
+            linha.append(InlineKeyboardButton(grupo_nome[:50], callback_data=f"mvartist|group|{grupo_id}"))
+            if len(linha) == 2:
+                botoes.append(linha)
+                linha = []
+        if linha:
+            botoes.append(linha)
+        botoes.append([InlineKeyboardButton("Mover direto para a subcategoria", callback_data="mvartist|no_group")])
+        botoes.append([InlineKeyboardButton("Cancelar", callback_data="mvartist|cancel")])
+        await query.answer()
+        await query.edit_message_text(
+            f"Subcategoria: <b>{esc(sub[0])}</b>. Escolha o grupo ou mova direto para a subcategoria:",
+            reply_markup=InlineKeyboardMarkup(botoes),
+            parse_mode="HTML",
+        )
+        return
+
+    if acao == "group":
+        group_id = int(partes[2])
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT nome FROM subsubcategorias WHERE id = %s AND subcategoria_id = %s", (group_id, context.user_data.get("mv_artist_sub")))
+        grupo = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not grupo:
+            await query.answer("Grupo inválido para esta subcategoria.", show_alert=True)
+            return
+        await query.answer("Destino selecionado.")
+        await _salvar_movimento_artista(query, context, sub_id=context.user_data["mv_artist_sub"], subsub_id=group_id)
+        return
+
+    if acao == "no_sub":
+        await query.answer("Destino selecionado.")
+        await _salvar_movimento_artista(query, context)
+        return
+
+    if acao == "no_group":
+        await query.answer("Destino selecionado.")
+        await _salvar_movimento_artista(query, context, sub_id=context.user_data["mv_artist_sub"])
+
+async def _salvar_movimento_artista(query, context, sub_id=None, subsub_id=None):
+    cat_id = context.user_data["mv_artist_cat"]
+    carta_ids = context.user_data["mv_artist_ids"]
+    nome = context.user_data["mv_artist_name"]
+    tiers = context.user_data["mv_artist_tiers"]
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT usa_tiers FROM categorias WHERE id = %s", (cat_id,))
+    usa_tiers = bool(cur.fetchone()[0])
+    if not usa_tiers and len(tiers) > 1:
+        cur.close()
+        conn.close()
+        await query.edit_message_text(
+            "Não movi as cartas: o destino está configurado com tier único e este artista tem vários tiers. "
+            "Ative os cinco tiers na categoria de destino ou escolha outra categoria."
+        )
+        return
+    tiers_destino = tiers if usa_tiers else [1]
+    cur.execute(
+        "SELECT id FROM cartas WHERE categoria_id = %s AND LOWER(TRIM(nome)) = LOWER(TRIM(%s)) "
+        "AND tier = ANY(%s) AND NOT (id = ANY(%s)) LIMIT 1",
+        (cat_id, nome, tiers_destino, carta_ids),
+    )
+    conflito = cur.fetchone()
+    if conflito:
+        cur.close()
+        conn.close()
+        await query.edit_message_text(
+            f"Não movi as cartas: já existe outra versão de <b>{esc(nome)}</b> na categoria de destino. "
+            "Remova ou reorganize essa entrada primeiro.",
+            parse_mode="HTML",
+        )
+        return
+    if usa_tiers:
+        cur.execute(
+            "UPDATE cartas SET categoria_id = %s, subcategoria_id = %s, subsubcategoria_id = %s WHERE id = ANY(%s)",
+            (cat_id, sub_id, subsub_id, carta_ids),
+        )
+    else:
+        cur.execute(
+            "UPDATE cartas SET categoria_id = %s, subcategoria_id = %s, subsubcategoria_id = %s, tier = 1, peso_drop = %s WHERE id = ANY(%s)",
+            (cat_id, sub_id, subsub_id, TIERS_CONFIG[1]["peso"], carta_ids),
+        )
+    movidas = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    await query.edit_message_text(
+        f"✅ Movi <b>{movidas}</b> carta(s) de <b>{esc(nome)}</b> para "
+        f"<b>{esc(context.user_data['mv_artist_cat_name'])}</b>.",
+        parse_mode="HTML",
+    )
+    for key in ("mv_artist_name", "mv_artist_ids", "mv_artist_tiers", "mv_artist_admin", "mv_artist_chat", "mv_artist_cat", "mv_artist_sub", "mv_artist_cat_name"):
+        context.user_data.pop(key, None)
 
 async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -4947,6 +5345,18 @@ async def main():
     )
     app.add_handler(conv_txmgr)
 
+    conv_mover_artista = ConversationHandler(
+        entry_points=[CallbackQueryHandler(studio_moverartista_start, pattern=r"^studio_go\|moverartista$")],
+        states={
+            MV_ARTIST_NAME: [CallbackQueryHandler(studio_moverartista_lista_callback, pattern=r"^mvlist\|")],
+        },
+        fallbacks=[CommandHandler("cancelar", studio_moverartista_cancelar)],
+        allow_reentry=True,
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(conv_mover_artista)
+
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler(["comandos", "comados"], cmd_comandos))
@@ -4971,6 +5381,7 @@ async def main():
     app.add_handler(CommandHandler("delcarta", cmd_del_carta))
     app.add_handler(CommandHandler("deleteall", cmd_deleteall))
     app.add_handler(CallbackQueryHandler(callback_deleteall, pattern=r"^deleteall\|"))
+    app.add_handler(CallbackQueryHandler(callback_moverartista, pattern=r"^mvartist\|"))
     app.add_handler(CommandHandler("dargiros", cmd_dar_giros))
     app.add_handler(CommandHandler("addadm", cmd_add_adm))
     app.add_handler(CommandHandler("remadm", cmd_rem_adm))
@@ -5016,6 +5427,8 @@ async def main():
 
     await app.initialize()
     await app.start()
+    await asyncio.to_thread(repor_giros_diarios)
+    asyncio.create_task(loop_reposicao_diaria())
 
     await app.bot.set_my_commands([
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
