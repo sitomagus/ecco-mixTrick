@@ -545,6 +545,15 @@ def iniciar_banco():
             original_file_id TEXT,
             event_id INTEGER
         );
+        CREATE TABLE IF NOT EXISTS tags (
+            id SERIAL PRIMARY KEY,
+            nome TEXT UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS carta_tags (
+            carta_id INTEGER NOT NULL REFERENCES cartas(id) ON DELETE CASCADE,
+            tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (carta_id, tag_id)
+        );
         CREATE TABLE IF NOT EXISTS inventario (
             id SERIAL PRIMARY KEY,
             user_id BIGINT REFERENCES usuarios(user_id),
@@ -979,6 +988,8 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verificar_usuario(user.id, user.username)
     texto = obter_texto_publico("comandos_texto")
     comandos_novos = [
+        ("/tag", "• /tag nome — Ver Minha coleção e Catálogo filtrados por tag"),
+        ("/col", "• /col tag — Ver sua coleção filtrada por tag"),
         ("/perfil", "• /perfil [@pessoa] — Ver e editar seu perfil, XP e carta favorita"),
         ("/carta", "• /carta ID ou nome — Ver uma carta e consultar quantas cópias você possui"),
         ("/eventos", "• /eventos — Abrir eventos ativos e suas cartas especiais"),
@@ -990,7 +1001,7 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     linhas_ausentes = [
         linha for comando, linha in comandos_novos
-        if (comando not in texto or (comando == "/trocar" and "@pessoa" not in texto) or (comando == "/carta" and "ou nome" not in texto))
+        if (comando not in texto or (comando == "/trocar" and "@pessoa" not in texto) or (comando == "/carta" and "ou nome" not in texto) or (comando == "/col" and "/col tag" not in texto) or (comando == "/tag" and "/tag nome" not in texto))
     ]
     if linhas_ausentes:
         texto = f"{texto.rstrip()}\n" + "\n".join(linhas_ausentes)
@@ -2490,7 +2501,8 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     verificar_usuario(user.id, user.username)
-    await _mostrar_colecao(msg, user.id, user.username, 0)
+    tag_name = " ".join(context.args).strip() if context.args else None
+    await _mostrar_colecao(msg, user.id, user.username, 0, tag_name=tag_name, callback_prefix="col")
     return
     apelido_user, _ = obter_apelido(user.id, user.username)
 
@@ -2530,9 +2542,12 @@ async def cmd_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas.append("\n<i>Use /artista nome para ver detalhes ou /ranking nome para ver o top jogadores.</i>")
     await msg.reply_text("\n".join(linhas)[:4000], parse_mode="HTML")
 
-async def _mostrar_colecao(target, user_id: int, username: str | None = None, page: int = 0):
+async def _mostrar_colecao(target, user_id: int, username: str | None = None, page: int = 0, tag_name: str | None = None, callback_prefix: str = "colecao"):
     conn=get_db(); cur=conn.cursor()
-    cur.execute("SELECT c.id,c.nome,c.tier,i.quantidade FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id=%s ORDER BY c.nome,c.tier,c.id",(user_id,))
+    if tag_name:
+        cur.execute("SELECT c.id,c.nome,c.tier,i.quantidade FROM inventario i JOIN cartas c ON c.id=i.carta_id JOIN carta_tags ct ON ct.carta_id=c.id JOIN tags t ON t.id=ct.tag_id WHERE i.user_id=%s AND LOWER(t.nome)=LOWER(%s) ORDER BY c.nome,c.tier,c.id",(user_id,tag_name))
+    else:
+        cur.execute("SELECT c.id,c.nome,c.tier,i.quantidade FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id=%s ORDER BY c.nome,c.tier,c.id",(user_id,))
     rows=cur.fetchall()
     cur.execute("SELECT LOWER(nome),COUNT(*) FROM cartas GROUP BY LOWER(nome)")
     total_tiers=dict(cur.fetchall()); cur.close(); conn.close()
@@ -2544,7 +2559,8 @@ async def _mostrar_colecao(target, user_id: int, username: str | None = None, pa
         grouped={}
         for cid,nome,tier,qty in rows: grouped.setdefault(nome,[]).append((cid,tier,qty))
         entries=list(grouped.items()); size=8; pages=max(1,(len(entries)+size-1)//size); page=max(0,min(page,pages-1))
-        lines=[f"🫧 <b>Coleção de {esc(apelido)}</b> · página {page+1}/{pages}\n"]
+        titulo_colecao=f"Coleção #{esc(tag_name)}" if tag_name else f"Coleção de {esc(apelido)}"
+        lines=[f"🫧 <b>{titulo_colecao}</b> · página {page+1}/{pages}\n"]
         for name, variants in entries[page*size:(page+1)*size]:
             n_total=total_tiers.get(name.lower(),len(variants))
             versions=", ".join(f"T{t} (<code>#{cid}</code> ×{qty})" for cid,t,qty in variants)
@@ -2553,9 +2569,9 @@ async def _mostrar_colecao(target, user_id: int, username: str | None = None, pa
         buttons=[]
         if pages>1:
             nav=[]
-            if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"colecao|{page-1}|{user_id}"))
-            nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="colecao|noop"))
-            if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"colecao|{page+1}|{user_id}"))
+            if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"{callback_prefix}|{page-1}|{user_id}"+(f"|{tag_name}" if tag_name else "")))
+            nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data=f"{callback_prefix}|noop"))
+            if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"{callback_prefix}|{page+1}|{user_id}"+(f"|{tag_name}" if tag_name else "")))
             buttons.append(nav)
         markup=InlineKeyboardMarkup(buttons) if buttons else None; text="\n".join(lines)
     if hasattr(target,"edit_message_text"):
@@ -2570,6 +2586,61 @@ async def callback_colecao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.from_user.id!=user_id:
         await q.answer("Abra /colecao para ver sua coleção.",show_alert=True); return
     await q.answer(); await _mostrar_colecao(q,user_id,q.from_user.username,int(p[1]))
+
+async def callback_col_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; p=q.data.split("|")
+    if p[1]=="noop": await q.answer(); return
+    if len(p)==3:
+        user_id=int(p[2])
+        if q.from_user.id!=user_id:
+            await q.answer("Abra /colecao para ver sua coleção.",show_alert=True); return
+        await q.answer(); await _mostrar_colecao(q,user_id,q.from_user.username,int(p[1])); return
+    if len(p)<4: await q.answer(); return
+    user_id=int(p[2]); tag_name=p[3]
+    if q.from_user.id!=user_id:
+        await q.answer("Abra /col para ver sua coleção.",show_alert=True); return
+    await q.answer(); await _mostrar_colecao(q,user_id,q.from_user.username,int(p[1]),tag_name=tag_name,callback_prefix="col")
+
+async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message; user=update.effective_user
+    if not msg or not user: return
+    name=" ".join(context.args).strip()
+    if not name:
+        await msg.reply_text("Use <code>/tag nome-da-tag</code> para ver Minha coleção e Catálogo.",parse_mode="HTML"); return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT id,nome FROM tags WHERE LOWER(nome)=LOWER(%s)",(name,)); row=cur.fetchone(); cur.close(); conn.close()
+    if not row:
+        await msg.reply_text(f"Não encontrei a tag <b>{esc(name)}</b>.",parse_mode="HTML"); return
+    tid,tag=row
+    buttons=[[InlineKeyboardButton("♻️ Minha coleção",callback_data=f"tag|mine|{tid}|{user.id}|0"),InlineKeyboardButton("📚 Catálogo",callback_data=f"tag|catalog|{tid}|{user.id}|0")]]
+    await msg.reply_text(f"🏷️ <b>Tag: {esc(tag)}</b>\nEscolha o que deseja consultar:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+
+async def callback_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; p=q.data.split("|")
+    if len(p)<5 or p[1]=="noop": await q.answer(); return
+    mode,tag_id,user_id,page=p[1],int(p[2]),int(p[3]),int(p[4])
+    if q.from_user.id!=user_id:
+        await q.answer("Abra /tag para consultar suas opções.",show_alert=True); return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT nome FROM tags WHERE id=%s",(tag_id,)); row=cur.fetchone()
+    if not row:
+        cur.close(); conn.close(); await q.answer("Essa tag não existe mais.",show_alert=True); return
+    tag=row[0]
+    if mode=="mine":
+        cur.close(); conn.close(); await q.answer(); await _mostrar_colecao(q,user_id,q.from_user.username,page,tag_name=tag,callback_prefix="col"); return
+    cur.execute("SELECT c.id,c.nome,c.tier,COALESCE(SUM(i.quantidade) FILTER (WHERE i.user_id=%s),0) FROM cartas c JOIN carta_tags ct ON ct.carta_id=c.id LEFT JOIN inventario i ON i.carta_id=c.id WHERE ct.tag_id=%s GROUP BY c.id,c.nome,c.tier ORDER BY c.nome,c.tier,c.id",(user_id,tag_id))
+    rows=cur.fetchall(); cur.close(); conn.close(); size=8; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1)); rows_page=rows[page*size:(page+1)*size]
+    lines=[f"📚 <b>Catálogo da tag {esc(tag)}</b> · {len(rows)} carta(s) · página {page+1}/{pages}\n"]
+    lines.extend(f"• <code>#{cid}</code> {esc(name)} (T{tier})" for cid,name,tier,_ in rows_page)
+    for cid,name,tier,owned in rows_page:
+        if owned: lines.append(f"  ↳ Você possui {owned}x da carta #{cid}.")
+    if not rows: lines.append("Nenhuma carta cadastrada com essa tag.")
+    buttons=[]
+    if pages>1:
+        nav=[]
+        if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"tag|catalog|{tag_id}|{user_id}|{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="tag|noop"))
+        if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"tag|catalog|{tag_id}|{user_id}|{page+1}"))
+        buttons.append(nav)
+    await q.answer(); await q.edit_message_text("\n".join(lines),parse_mode="HTML",reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
 def _montar_wishlist(user_id: int, dono_id: int | None = None):
     conn = get_db()
@@ -4343,7 +4414,7 @@ async def wiz_receber_novo_nome(update: Update, context: ContextTypes.DEFAULT_TY
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT nome FROM cartas WHERE LOWER(nome) = LOWER(%s) LIMIT 1", (novo_nome,))
+    cur.execute("SELECT nome FROM cartas WHERE LOWER(nome)=LOWER(%s) AND categoria_id=%s AND subcategoria_id IS NOT DISTINCT FROM %s AND subsubcategoria_id IS NOT DISTINCT FROM %s AND event_id IS NOT DISTINCT FROM %s LIMIT 1", (novo_nome,context.user_data["cat_id"],context.user_data.get("sub_id"),context.user_data.get("subsub_id"),context.user_data.get("event_id")))
     ja_existe = cur.fetchone()
     cur.close()
     conn.close()
@@ -4385,6 +4456,12 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_MIDIA
 
     if context.user_data.get("event_id"):
+        conn=get_db(); cur=conn.cursor()
+        cur.execute("SELECT id FROM cartas WHERE LOWER(nome)=LOWER(%s) AND event_id=%s AND categoria_id=%s AND subcategoria_id IS NOT DISTINCT FROM %s AND subsubcategoria_id IS NOT DISTINCT FROM %s LIMIT 1",(context.user_data.get("nome_carta"),context.user_data["event_id"],context.user_data["cat_id"],context.user_data.get("sub_id"),context.user_data.get("subsub_id")))
+        duplicate=cur.fetchone(); cur.close(); conn.close()
+        if duplicate:
+            await msg.reply_text(f"⚠️ Já existe uma carta <b>{esc(context.user_data.get('nome_carta'))}</b> nessa categoria do evento (#{duplicate[0]}).",parse_mode="HTML")
+            return ST_MIDIA
         await msg.reply_text(
             "🎉 Carta de evento: ela não usa tiers normais. Confirme o cadastro:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Cadastrar carta do evento", callback_data="wiz_tier|1")], [InlineKeyboardButton("🔙 Voltar ao Studio", callback_data="wiz_cancel")]]),
@@ -4395,7 +4472,7 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cat_id = context.user_data["cat_id"]
-    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s AND subcategoria_id IS NOT DISTINCT FROM %s AND subsubcategoria_id IS NOT DISTINCT FROM %s", (nome_carta, cat_id, context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
+    cur.execute("SELECT tier FROM cartas WHERE LOWER(nome) = LOWER(%s) AND event_id IS NULL AND categoria_id = %s AND subcategoria_id IS NOT DISTINCT FROM %s AND subsubcategoria_id IS NOT DISTINCT FROM %s", (nome_carta, cat_id, context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
     ocupados = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
@@ -4645,6 +4722,7 @@ def _montar_menu_edicao(d: dict) -> tuple[str, InlineKeyboardMarkup]:
     )
 
     botoes = [
+        [InlineKeyboardButton("🏷️ Editar tags", callback_data="ed_tags")],
         [
             InlineKeyboardButton("✏️ Nome", callback_data="ed_op|nome"),
             InlineKeyboardButton("📂 Categoria/Sub", callback_data="ed_op|cat"),
@@ -4697,6 +4775,20 @@ async def ed_receber_id_texto(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_user.id != context.user_data.get("admin_id"):
         return ED_MENU
 
+    if context.user_data.pop("ed_waiting_tags", False):
+        d=context.user_data.get("ed_carta")
+        if not d: return ED_MENU
+        values=[x.strip().lstrip("#")[:24] for x in update.message.text.split(",") if x.strip()]
+        conn=get_db(); cur=conn.cursor()
+        cur.execute("DELETE FROM carta_tags WHERE carta_id=%s",(d["id"],))
+        for value in values:
+            cur.execute("INSERT INTO tags(nome) VALUES(%s) ON CONFLICT(nome) DO UPDATE SET nome=EXCLUDED.nome RETURNING id",(value,))
+            tid=cur.fetchone()[0]; cur.execute("INSERT INTO carta_tags(carta_id,tag_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(d["id"],tid))
+        conn.commit(); cur.close(); conn.close()
+        texto,markup=_montar_menu_edicao(d)
+        await update.message.reply_text("Tags atualizadas.\n\n"+texto,reply_markup=markup,parse_mode="HTML")
+        return ED_MENU
+
     alvo_raw = update.message.text.replace("#", "").strip()
     if not alvo_raw.isdigit():
         busca = alvo_raw.strip()
@@ -4726,6 +4818,15 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "ed_noop":
         await query.answer()
+        return ED_MENU
+
+    if query.data == "ed_tags":
+        d=context.user_data.get("ed_carta")
+        if not d:
+            await query.answer("Escolha uma carta primeiro.",show_alert=True); return ED_MENU
+        conn=get_db(); cur=conn.cursor(); cur.execute("SELECT t.nome FROM tags t JOIN carta_tags ct ON ct.tag_id=t.id WHERE ct.carta_id=%s ORDER BY t.nome",(d["id"],)); current=", ".join(x[0] for x in cur.fetchall()); cur.close(); conn.close()
+        context.user_data["ed_waiting_tags"]=True
+        await query.answer(); await query.edit_message_text(f"Tags atuais: {esc(current) if current else 'nenhuma'}\nEnvie tags separadas por vírgula (até 24 caracteres cada). Envie uma mensagem vazia para remover todas:")
         return ED_MENU
 
     if query.data == "studio_menu":
@@ -7403,7 +7504,7 @@ async def main():
         ],
         states={
             ED_MENU: [
-                CallbackQueryHandler(ed_menu_callback, pattern=r"^(ed_(pick\||page\||searchpage\||search$|delete(_confirm|_cancel)?$|back_list$|noop$|op\||salvar$)|studio_menu$)"),
+                CallbackQueryHandler(ed_menu_callback, pattern=r"^(ed_(pick\||page\||searchpage\||search$|tags$|delete(_confirm|_cancel)?$|back_list$|noop$|op\||salvar$)|studio_menu$)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_id_texto),
             ],
             ED_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ed_receber_nome)],
@@ -7508,6 +7609,9 @@ async def main():
     app.add_handler(CommandHandler(["ranking", "top"], cmd_ranking))
     app.add_handler(CommandHandler(["colecao", "col"], cmd_colecao))
     app.add_handler(CallbackQueryHandler(callback_colecao, pattern=r"^colecao\|"))
+    app.add_handler(CommandHandler("tag", cmd_tag))
+    app.add_handler(CallbackQueryHandler(callback_tag, pattern=r"^tag\|"))
+    app.add_handler(CallbackQueryHandler(callback_col_tag, pattern=r"^col\|"))
     app.add_handler(CommandHandler("carta", cmd_carta))
     app.add_handler(CallbackQueryHandler(callback_carta_busca, pattern=r"^carta\|"))
     app.add_handler(CommandHandler("trocar", cmd_trocar))
