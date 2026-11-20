@@ -1397,7 +1397,7 @@ async def _renderizar_perfil(user_id: int):
     nome_parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else None
     # O bloco <pre> preserva espaços e barras do desenho ASCII no Telegram.
     parceiro = (
-        f"<pre>  /)/)   (\\(\\\n {  . .}  {. .  }\no/💍  ^^ \\</pre>\n"
+        "<pre>  /)/)   (\\(\\\n {  . .}  {. .  }\no/💍  ^^ \\</pre>\n"
         f"<blockquote>Meu coração pertence a <b>{esc(nome_parceiro)}</b></blockquote>"
         if nome_parceiro else "🫧 Solteiro(a)"
     )
