@@ -32,11 +32,20 @@ DATABASE_URL = os.environ["DATABASE_URL"].strip()
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].strip().rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
-try:
-    SUPER_ADMIN_ID = int(os.environ["SUPER_ADMIN_ID"].strip())
-except (KeyError, ValueError) as exc:
-    raise RuntimeError("Configure SUPER_ADMIN_ID nas variáveis de ambiente do Render.") from exc
-SUPER_ADMINS = [SUPER_ADMIN_ID]
+_super_admin_ids_raw = os.environ.get("SUPER_ADMIN_IDS", "").strip()
+if _super_admin_ids_raw:
+    try:
+        SUPER_ADMINS = list(dict.fromkeys(int(value) for value in re.split(r"[,;\s]+", _super_admin_ids_raw) if value.strip()))
+    except ValueError as exc:
+        raise RuntimeError("SUPER_ADMIN_IDS deve conter IDs numéricos separados por vírgula.") from exc
+else:
+    try:
+        SUPER_ADMINS = [int(os.environ["SUPER_ADMIN_ID"].strip())]
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError("Configure SUPER_ADMIN_IDS ou SUPER_ADMIN_ID nas variáveis de ambiente do Render.") from exc
+if not SUPER_ADMINS:
+    raise RuntimeError("Configure pelo menos um ID em SUPER_ADMIN_IDS.")
+SUPER_ADMIN_ID = SUPER_ADMINS[0]
 
 GIROS_DIARIOS = 10
 FUSO_GIROS = ZoneInfo("America/Sao_Paulo")
@@ -845,7 +854,7 @@ PERMISSOES_EQUIPE = {
 }
 
 def tem_permissao(user_id: int, permissao: str) -> bool:
-    if user_id == SUPER_ADMIN_ID or eh_admin(user_id):
+    if user_id in SUPER_ADMINS or eh_admin(user_id):
         return True
     conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT 1 FROM admin_permissoes WHERE user_id=%s AND permissao=%s",(user_id,permissao))
@@ -854,7 +863,7 @@ def tem_permissao(user_id: int, permissao: str) -> bool:
     return allowed
 
 def permissoes_usuario(user_id: int) -> set[str]:
-    if user_id == SUPER_ADMIN_ID or eh_admin(user_id):
+    if user_id in SUPER_ADMINS or eh_admin(user_id):
         return set(PERMISSOES_EQUIPE)
     conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT permissao FROM admin_permissoes WHERE user_id=%s",(user_id,))
@@ -3726,14 +3735,14 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
         return
     if context.user_data.get("equipe_add_pendente"):
         context.user_data.pop("equipe_add_pendente",None)
-        if user.id != SUPER_ADMIN_ID:
+        if user.id not in SUPER_ADMINS:
             await msg.reply_text("Somente o superadministrador pode adicionar pessoas à equipe.")
             raise ApplicationHandlerStop
         try: target_id=int(msg.text.strip())
         except ValueError:
             await msg.reply_text("Envie o ID numérico do Telegram.")
             raise ApplicationHandlerStop
-        if target_id == SUPER_ADMIN_ID:
+        if target_id in SUPER_ADMINS:
             await msg.reply_text("Essa pessoa já é o superadministrador principal.")
             raise ApplicationHandlerStop
         conn=get_db(); cur=conn.cursor()
@@ -7073,13 +7082,13 @@ def _studio_teclado(page: int, user_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🖼️ Molduras", callback_data="studio_ui|molduras"), InlineKeyboardButton("🎉 Eventos", callback_data="evento|admin")],
         ]
     else:
-        if user_id == SUPER_ADMIN_ID:
+        if user_id in SUPER_ADMINS:
             botoes.append([InlineKeyboardButton("👥 Ver administradores", callback_data="studio_ui|admins|0")])
         if tem_permissao(user_id,"banimentos"):
             botoes.append([InlineKeyboardButton("🚫 Banimentos", callback_data="studio_ui|ban")])
         row=[]
         if tem_permissao(user_id,"giros"): row.append(InlineKeyboardButton("🎲 Dar giros", callback_data="studio_ui|help_dargiros"))
-        if user_id == SUPER_ADMIN_ID: row.append(InlineKeyboardButton("🧹 Zerar inventários", callback_data="studio_ui|help_deleteall"))
+        if user_id in SUPER_ADMINS: row.append(InlineKeyboardButton("🧹 Zerar inventários", callback_data="studio_ui|help_deleteall"))
         if row: botoes.append(row)
     if page == 1:
         botoes.append([InlineKeyboardButton("🏷️ Gerenciar tags",callback_data="studio_ui|tags")])
@@ -7105,7 +7114,7 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     permission_by_action={"tags":"tags","molduras":"molduras_eventos","molduratri":"molduras_eventos","moldurafile":"molduras_eventos","molduradel":"molduras_eventos","ban":"banimentos","bansearch":"banimentos","banpage":"banimentos","banconfirm":"banimentos","unban":"banimentos","help_dargiros":"giros","admins":"equipe"}
     required=permission_by_action.get(action)
     if required == "equipe":
-        if q.from_user.id != SUPER_ADMIN_ID:
+        if q.from_user.id not in SUPER_ADMINS:
             await q.answer("Somente o superadministrador pode gerenciar a equipe.",show_alert=True); return
     elif required and not tem_permissao(q.from_user.id,required):
         await q.answer("Você não tem essa permissão.",show_alert=True); return
@@ -7148,16 +7157,16 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "team":
         await _mostrar_permissoes_equipe(q,int(p[2])); return
     if action == "teamadd":
-        if q.from_user.id != SUPER_ADMIN_ID:
+        if q.from_user.id not in SUPER_ADMINS:
             await q.answer("Somente o superadministrador pode adicionar pessoas à equipe.",show_alert=True); return
         context.user_data["equipe_add_pendente"] = True
         await q.answer(); await q.message.reply_text("Envie o ID numérico da pessoa para adicionar à equipe. Depois você define a função e as permissões pelos botões.")
         return
     if action == "perm":
-        if q.from_user.id != SUPER_ADMIN_ID:
+        if q.from_user.id not in SUPER_ADMINS:
             await q.answer("Somente o superadministrador pode alterar permissões.",show_alert=True); return
         target=int(p[2]); key=p[3]
-        if target == SUPER_ADMIN_ID:
+        if target in SUPER_ADMINS:
             await q.answer("O superadministrador principal não pode ser alterado.",show_alert=True); return
         conn=get_db(); cur=conn.cursor()
         if key == "remove":
@@ -7196,7 +7205,7 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer(); await q.message.reply_text(f"Use {command}."); return
 
 async def _mostrar_lista_admins(q, page: int = 0):
-    if q.from_user.id != SUPER_ADMIN_ID:
+    if q.from_user.id not in SUPER_ADMINS:
         await q.answer("Somente o superadministrador pode gerenciar permissões da equipe.", show_alert=True); return
     conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT a.user_id,a.funcao,u.username FROM admins a LEFT JOIN usuarios u ON u.user_id=a.user_id ORDER BY a.funcao,a.user_id")
@@ -7224,13 +7233,13 @@ async def _mostrar_lista_admins(q, page: int = 0):
     await q.answer(); await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
 
 async def _mostrar_permissoes_equipe(q, user_id: int):
-    if q.from_user.id != SUPER_ADMIN_ID:
+    if q.from_user.id not in SUPER_ADMINS:
         await q.answer("Somente o superadministrador pode alterar a equipe.",show_alert=True); return
     conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT funcao FROM admins WHERE user_id=%s",(user_id,)); row=cur.fetchone()
     cur.execute("SELECT permissao FROM admin_permissoes WHERE user_id=%s",(user_id,)); enabled={r[0] for r in cur.fetchall()}
     cur.close(); conn.close()
-    if user_id == SUPER_ADMIN_ID:
+    if user_id in SUPER_ADMINS:
         await q.answer("O superadministrador principal é fixo.",show_alert=True); return
     if not row:
         await q.answer("Pessoa não encontrada na equipe.",show_alert=True); return
@@ -7561,7 +7570,7 @@ async def cmd_del_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Carta não encontrada.")
 
 async def cmd_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id not in SUPER_ADMINS:
         await update.effective_message.reply_text("Somente o administrador principal pode zerar o histórico de cartas de todos.")
         return
     teclado = InlineKeyboardMarkup([
@@ -7577,7 +7586,7 @@ async def cmd_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != SUPER_ADMIN_ID:
+    if query.from_user.id not in SUPER_ADMINS:
         await query.answer("Somente o administrador principal pode zerar o histórico de cartas de todos.", show_alert=True)
         return
     if query.data == "deleteall|cancel":
@@ -8161,7 +8170,7 @@ async def cmd_add_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Editor <code>{target_id}</code> adicionado. Pode editar textos públicos e do painel.", parse_mode="HTML")
 
 async def cmd_ver_adms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID:
+    if update.effective_user.id not in SUPER_ADMINS:
         await update.effective_message.reply_text("Somente o superadministrador pode consultar e gerenciar a equipe."); return
     await update.effective_message.reply_text("👥 <b>Administradores e editores</b> — use as setas para navegar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir lista", callback_data="studio_ui|admins|0")]]), parse_mode="HTML")
 
