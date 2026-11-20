@@ -77,39 +77,6 @@ class GerenciadorEventos:
     def _eh_admin(self, user_id):
         return self.d["eh_admin"](user_id)
 
-    def _categorias_origem(self):
-        conn=self._db(); cur=conn.cursor()
-        cur.execute("SELECT id,nome FROM categorias WHERE event_id IS NULL ORDER BY nome")
-        rows=cur.fetchall(); cur.close(); conn.close(); return rows
-
-    def _teclado_clonar(self, event_id):
-        rows=self._categorias_origem()
-        buttons=[[InlineKeyboardButton(nome,callback_data=f"evento|clonecat|{event_id}|{cid}")] for cid,nome in rows]
-        buttons.append([InlineKeyboardButton("✅ Concluir categorias",callback_data=f"evento|clonedone|{event_id}")])
-        buttons.append([InlineKeyboardButton("🔙 Studio de eventos",callback_data="evento|admin")])
-        return InlineKeyboardMarkup(buttons)
-
-    def _clonar_categoria(self, event_id, source_id):
-        conn=self._db(); cur=conn.cursor()
-        cur.execute("SELECT nome,usa_tiers FROM categorias WHERE id=%s AND event_id IS NULL",(source_id,)); src=cur.fetchone()
-        if not src:
-            cur.close(); conn.close(); return False
-        source_name,uses_tiers=src
-        cur.execute("SELECT nome FROM eventos WHERE id=%s",(event_id,)); event=cur.fetchone()
-        if not event:
-            cur.close(); conn.close(); return False
-        clone_name=f"{source_name} · {event[0]}"
-        cur.execute("SELECT id FROM categorias WHERE event_id=%s AND nome=%s",(event_id,clone_name)); existing=cur.fetchone()
-        if existing:
-            cur.close(); conn.close(); return True
-        cur.execute("INSERT INTO categorias(nome,usa_tiers,event_id) VALUES(%s,%s,%s) RETURNING id",(clone_name,uses_tiers,event_id)); new_cat=cur.fetchone()[0]
-        cur.execute("SELECT id,nome FROM subcategorias WHERE categoria_id=%s ORDER BY id",(source_id,)); subs=cur.fetchall()
-        for old_sub,sub_name in subs:
-            cur.execute("INSERT INTO subcategorias(categoria_id,nome) VALUES(%s,%s) RETURNING id",(new_cat,sub_name)); new_sub=cur.fetchone()[0]
-            cur.execute("SELECT nome FROM subsubcategorias WHERE subcategoria_id=%s ORDER BY id",(old_sub,))
-            for (ss_name,) in cur.fetchall(): cur.execute("INSERT INTO subsubcategorias(subcategoria_id,nome) VALUES(%s,%s)",(new_sub,ss_name))
-        conn.commit(); cur.close(); conn.close(); return True
-
     def registrar(self, app):
         app.bot_data["eventos_manager"] = self
         app.add_handler(CommandHandler("eventos", self.cmd_eventos))
@@ -192,8 +159,8 @@ class GerenciadorEventos:
             [InlineKeyboardButton("📂 Abrir categoria de cartas", callback_data=f"evento|categoria|{event_id}")],
             [InlineKeyboardButton("🔙 Lista de eventos", callback_data="evento|admin")],
         ]
+        botoes.insert(-1,[InlineKeyboardButton("➕ Criar cartas deste evento",callback_data=f"studio_go|addevent|{event_id}")])
         await query.answer()
-        botoes.insert(-1,[InlineKeyboardButton("📂 Clonar categorias do catálogo",callback_data=f"evento|cloneprompt|{event_id}")])
         await query.edit_message_text(f"🎉 <b>{self._esc(e[2])}</b>\nAgenda: {self._esc(horario)}\nEstado: {ativo}; {teste}", reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
     async def _menu_evento(self, query, event_id, user_id, teste=False):
@@ -214,11 +181,13 @@ class GerenciadorEventos:
                 return
         conn = self._db()
         cur = conn.cursor()
-        cur.execute("SELECT id, nome FROM categorias WHERE event_id=%s ORDER BY nome", (event_id,))
+        cur.execute("SELECT id, nome FROM categorias WHERE event_id IS NULL ORDER BY nome")
         categorias = cur.fetchall()
         cur.close()
         conn.close()
         botoes = [[InlineKeyboardButton(nome, callback_data=f"evento|cat|{event_id}|{cat_id}|{user_id}|{int(teste)}")] for cat_id, nome in categorias]
+        if self._eh_admin(user_id):
+            botoes.append([InlineKeyboardButton("➕ Criar cartas deste evento",callback_data=f"studio_go|addevent|{event_id}")])
         botoes.append([InlineKeyboardButton("🌐 Girar no evento inteiro", callback_data=f"evento|quant|{event_id}|0|0|{user_id}|{int(teste)}")])
         botoes.append([InlineKeyboardButton("🔙 Eventos", callback_data="evento|lista")])
         await query.answer()
@@ -250,26 +219,7 @@ class GerenciadorEventos:
             if not self._eh_admin(q.from_user.id):
                 await q.answer("Apenas administradores.", show_alert=True); return
             context.user_data["evento_pendente"] = {"tipo": "novo"}
-            await q.answer(); await q.edit_message_text("Digite o nome do evento. Depois você selecionará as categorias existentes que serão clonadas para ele."); return
-        if acao == "clonecat":
-            if not self._eh_admin(q.from_user.id):
-                await q.answer("Apenas administradores.",show_alert=True); return
-            eid,cid=int(p[2]),int(p[3])
-            if not self._clonar_categoria(eid,cid):
-                await q.answer("Não consegui clonar essa categoria.",show_alert=True); return
-            await q.answer("Categoria e subcategorias clonadas.")
-            await q.edit_message_text("Selecione outra categoria para clonar ou conclua:",reply_markup=self._teclado_clonar(eid)); return
-        if acao == "clonedone":
-            if not self._eh_admin(q.from_user.id):
-                await q.answer("Apenas administradores.",show_alert=True); return
-            eid=int(p[2]); conn=self._db(); cur=conn.cursor(); cur.execute("SELECT COUNT(*) FROM categorias WHERE event_id=%s",(eid,)); count=cur.fetchone()[0]; cur.close(); conn.close()
-            await q.answer()
-            await q.edit_message_text("Evento pronto com as categorias clonadas." if count else "O evento ainda não tem categorias clonadas. Você pode adicionar alguma ou voltar ao Studio.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Clonar categoria",callback_data=f"evento|cloneprompt|{eid}")],[InlineKeyboardButton("🔙 Studio de eventos",callback_data="evento|admin")]]))
-            return
-        if acao == "cloneprompt":
-            if not self._eh_admin(q.from_user.id):
-                await q.answer("Apenas administradores.",show_alert=True); return
-            eid=int(p[2]); await q.answer(); await q.edit_message_text("Escolha a categoria original para clonar:",reply_markup=self._teclado_clonar(eid)); return
+            await q.answer(); await q.edit_message_text("Digite o nome do evento. As categorias e subcategorias do catálogo normal ficam disponíveis automaticamente para cadastrar as cartas do evento."); return
         if acao in ("ativar", "teste"):
             if not self._eh_admin(q.from_user.id):
                 await q.answer("Apenas administradores.", show_alert=True); return
@@ -299,13 +249,13 @@ class GerenciadorEventos:
             if not self._eh_admin(q.from_user.id):
                 await q.answer("Apenas administradores.", show_alert=True); return
             event_id = int(p[2]); conn = self._db(); cur = conn.cursor()
-            cur.execute("SELECT id,nome FROM categorias WHERE event_id=%s ORDER BY nome", (event_id,)); rows = cur.fetchall()
+            cur.execute("SELECT id,nome FROM categorias WHERE event_id IS NULL ORDER BY nome"); rows = cur.fetchall()
             cur.close(); conn.close()
             if not rows:
-                await q.answer(); await q.edit_message_text("Clone uma ou mais categorias originais para este evento:",reply_markup=self._teclado_clonar(event_id)); return
+                await q.answer("Cadastre categorias no catálogo primeiro.",show_alert=True); return
             buttons=[[InlineKeyboardButton(nome,callback_data=f"evento|cat|{event_id}|{cat_id}|{q.from_user.id}|0")] for cat_id,nome in rows]
-            buttons.append([InlineKeyboardButton("➕ Clonar mais categorias",callback_data=f"evento|cloneprompt|{event_id}")])
-            await q.answer(); await q.edit_message_text("Escolha a categoria clonada que deseja conferir:",reply_markup=InlineKeyboardMarkup(buttons)); return
+            buttons.append([InlineKeyboardButton("➕ Criar cartas deste evento",callback_data=f"studio_go|addevent|{event_id}")])
+            await q.answer(); await q.edit_message_text("Escolha a categoria do catálogo para conferir as cartas deste evento:",reply_markup=InlineKeyboardMarkup(buttons)); return
         if acao == "abrir":
             await self._menu_evento(q, int(p[2]), int(p[3]), bool(int(p[4])) if len(p) > 4 else False); return
         if acao == "cat":
@@ -431,7 +381,7 @@ class GerenciadorEventos:
             conn=self._db(); cur=conn.cursor(); cur.execute("INSERT INTO eventos(slug,nome) VALUES(%s,%s) ON CONFLICT(slug) DO UPDATE SET nome=EXCLUDED.nome RETURNING id", (slug,nome)); event_id=cur.fetchone()[0]
             conn.commit(); cur.close(); conn.close()
             context.user_data.pop("evento_pendente",None)
-            await msg.reply_text(f"Evento <b>{self._esc(nome)}</b> criado. Selecione uma ou mais categorias originais para clonar com suas subcategorias e grupos:",reply_markup=self._teclado_clonar(event_id),parse_mode="HTML"); return True
+            await msg.reply_text(f"Evento <b>{self._esc(nome)}</b> criado. Ele já usa as categorias e subcategorias existentes no catálogo.\nAtalhos: <code>/addcarta-{slug}</code> ou <code>/addcarta_{slug}</code>.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Criar cartas do evento",callback_data=f"studio_go|addevent|{event_id}")],[InlineKeyboardButton("⚙️ Configurar evento",callback_data=f"evento|config|{event_id}")]]),parse_mode="HTML"); return True
         if tipo == "agenda":
             try:
                 left,right=[x.strip() for x in msg.text.split("|")]
@@ -553,3 +503,5 @@ class GerenciadorEventos:
             except Exception as exc:
                 print(f"Erro na rotina de eventos: {exc}",flush=True)
             await __import__("asyncio").sleep(60)
+
+
