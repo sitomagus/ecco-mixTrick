@@ -6655,19 +6655,15 @@ def _montar_home_textos(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     page = max(0, min(page, total_paginas - 1))
 
     texto = (
-        f"📝 <b>Editor de Textos Públicos e do Studio</b> — Página {page + 1}/{total_paginas}\n\n"
-        "Lista de mensagens por comando/área. Escolha uma linha para editar texto e mídia.\n"
-        f"🎞️ <b>Mídia do /start:</b> {status_midia}\n\n"
-        "💡 <i>Dica: ao enviar qualquer texto ou emoji de Tier, basta usar os <b>Emojis Premium do Telegram</b> normalmente no teclado que o bot salva o ID animado automaticamente!</i>"
+        f"📝 <b>Editor de Textos Públicos e do Studio</b> — Página {page + 1}/{total_paginas}\n"
+        f"🎞️ Mídia do /start: {status_midia}\n"
+        "Digite o número ou busque pelo comando/nome. Ex.: casar, resultado ou wishlist. Para outros itens, digite ‘gif start’ ou ‘emoji tier’."
     )
 
     botoes = []
     itens=chaves[page * page_size:(page + 1) * page_size]
     inicio=page*page_size+1
-    texto += "\n".join(f"<b>{index:02d}.</b> {_area_texto_publico(chave)} — {TEXTOS_META[chave]['titulo']}" for index,chave in enumerate(itens,start=inicio))
-    texto += "\n\nToque no número correspondente para editar:"
-    for index,chave in enumerate(itens,start=inicio):
-        botoes.append([InlineKeyboardButton(f"✏️ Editar {index:02d}", callback_data=f"txmgr|item|{chave}")])
+    texto += "\n\n" + "\n".join(f"<b>{index:02d}.</b> {_area_texto_publico(chave)} — {TEXTOS_META[chave]['titulo']}" for index,chave in enumerate(itens,start=inicio))
     if total_paginas > 1:
         nav = []
         if page > 0:
@@ -6676,11 +6672,20 @@ def _montar_home_textos(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
         if page + 1 < total_paginas:
             nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"txmgr|page|{page + 1}"))
         botoes.append(nav)
-    botoes.extend([
-        [InlineKeyboardButton("🎞️ GIF / Foto do /start", callback_data="txmgr|start_media"), InlineKeyboardButton("🎨 Emojis dos Tiers", callback_data="txmgr|tiers")],
-        [InlineKeyboardButton("❌ Fechar", callback_data="txmgr|close")],
-    ])
-    return texto, InlineKeyboardMarkup(botoes)
+    return texto, InlineKeyboardMarkup(botoes) if botoes else None
+
+def _montar_resultados_busca_textos(chaves: list[str], page: int = 0) -> tuple[str, InlineKeyboardMarkup | None]:
+    size=6; pages=max(1,(len(chaves)+size-1)//size); page=max(0,min(page,pages-1))
+    parte=chaves[page*size:(page+1)*size]
+    linhas=[f"🔎 <b>Resultados da busca</b> — Página {page+1}/{pages}"]
+    linhas.extend(f"<b>{i:02d}.</b> {_area_texto_publico(k)} — {TEXTOS_META[k]['titulo']}" for i,k in enumerate(parte,start=1))
+    linhas.append("\nDigite o número para abrir; refine a busca digitando outro termo.")
+    if pages<=1: return "\n".join(linhas),None
+    nav=[]
+    if page: nav.append(InlineKeyboardButton("⬅️ Anterior",callback_data=f"txmgr|searchpage|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="txmgr|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("Próxima ➡️",callback_data=f"txmgr|searchpage|{page+1}"))
+    return "\n".join(linhas),InlineKeyboardMarkup([nav])
 
 def _montar_view_texto(chave: str) -> tuple[str, InlineKeyboardMarkup]:
     meta = TEXTOS_META[chave]
@@ -6749,6 +6754,61 @@ async def txmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return TX_HOME
 
+async def txmgr_selecionar_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message
+    if not msg or not msg.text or update.effective_user.id!=context.user_data.get("admin_id"):
+        return TX_HOME
+    raw=msg.text.strip()
+    if raw.startswith("/"): raw=raw.split()[0]
+    term=raw.strip().lstrip("/").casefold()
+    if term in ("gif start","midia start","mídia start","gif do start","foto start"):
+        context.user_data.pop("tx_busca_resultados",None)
+        texto,markup=_montar_view_start_media()
+        await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+        return TX_START_MEDIA
+    if term in ("emoji tier","emojis tier","tiers","emoji dos tiers"):
+        context.user_data.pop("tx_busca_resultados",None)
+        texto,markup=_montar_view_tiers_emojis()
+        await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+        return TX_TIERS_MENU
+
+    resultados=context.user_data.get("tx_busca_resultados")
+    if term.isdigit():
+        numero=int(term)
+        if resultados:
+            page=context.user_data.get("tx_busca_page",0); parte=resultados[page*6:(page+1)*6]
+            if 1<=numero<=len(parte): chave=parte[numero-1]
+            else:
+                await msg.reply_text("Digite um dos números exibidos na página.")
+                return TX_HOME
+        else:
+            keys=list(TEXTOS_META); page=context.user_data.get("tx_page",0); start=page*6; parte=keys[start:start+6]
+            if start+1<=numero<=start+len(parte): chave=keys[numero-1]
+            elif 1<=numero<=len(parte): chave=parte[numero-1]
+            else:
+                await msg.reply_text("Digite um dos números desta página ou pesquise pelo comando/título.")
+                return TX_HOME
+        context.user_data.pop("tx_busca_resultados",None)
+        context.user_data["tx_chave"]=chave
+        texto,markup=_montar_view_texto(chave)
+        await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+        return TX_VIEW
+
+    busca=term
+    matches=[k for k in TEXTOS_META if busca in _area_texto_publico(k).casefold().lstrip("/") or busca in TEXTOS_META[k]["titulo"].casefold()]
+    if not matches:
+        await msg.reply_text("Não encontrei esse comando ou texto. Tente outra palavra, como ‘casar’, ‘resultado’ ou ‘wishlist’.")
+        return TX_HOME
+    if len(matches)==1:
+        chave=matches[0]; context.user_data.pop("tx_busca_resultados",None); context.user_data["tx_chave"]=chave
+        texto,markup=_montar_view_texto(chave)
+        await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+        return TX_VIEW
+    context.user_data["tx_busca_resultados"]=matches; context.user_data["tx_busca_page"]=0
+    texto,markup=_montar_resultados_busca_textos(matches,0)
+    await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+    return TX_HOME
+
 async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query.from_user.id != context.user_data.get("admin_id") or not tem_permissao(query.from_user.id,"textos"):
@@ -6773,9 +6833,18 @@ async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if acao == "page":
         page = int(partes[2])
         context.user_data["tx_page"] = page
+        context.user_data.pop("tx_busca_resultados",None)
         texto, markup = _montar_home_textos(page)
         await query.answer()
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_HOME
+
+    if acao == "searchpage":
+        resultados=context.user_data.get("tx_busca_resultados",[])
+        page=int(partes[2]); context.user_data["tx_busca_page"]=page
+        texto,markup=_montar_resultados_busca_textos(resultados,page)
+        await query.answer()
+        await query.edit_message_text(texto,reply_markup=markup,parse_mode="HTML")
         return TX_HOME
 
     if acao == "noop":
@@ -8225,7 +8294,11 @@ async def main():
             CallbackQueryHandler(txmgr_start, pattern=r"^studio_go\|textos$"),
         ],
         states={
-            TX_HOME: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(item\||page\||noop$|start_media$|tiers$|close$)")],
+            TX_HOME: [
+                CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(item\||page\||searchpage\||noop$|start_media$|tiers$|close$)"),
+                CommandHandler(["start","ajuda","comandos","comados","apelido","perfil","casar","divorciar","meuid","girar","catalogo","cartas","colecao","col","artista","ranking","top","tag","carta","trocar","doar","wishlist","loja","eventos","natalpresente","pular"],txmgr_selecionar_texto),
+                MessageHandler(filters.TEXT & ~filters.COMMAND,txmgr_selecionar_texto),
+            ],
             TX_VIEW: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(edit$|reset$|home$|text_media\||del_text_media\|)")],
             TX_EDIT_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, txmgr_receber_texto)],
             TX_START_MEDIA: [
@@ -8312,11 +8385,10 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_girar_subsubcategoria, pattern=r"^rsubsub\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_mais_opcoes, pattern=r"^rmore\|"))
     app.add_handler(CallbackQueryHandler(callback_girar_quantidade, pattern=r"^rqtd\|"))
-    app.add_handler(CallbackQueryHandler(callback_dargiros, pattern=r"^darg\|"))
-    app.add_handler(CallbackQueryHandler(callback_ranking_cid, pattern=r"^rank_cid\|"))
+    app.add_handler(CallbackQueryHandler(callbazback_ranking_cid, pattern=r"^rank_cid\|"))
     app.add_handler(CallbackQueryHandler(callback_catalogo, pattern=r"^catlist\|"))
     app.add_handler(CallbackQueryHandler(cmd_catalogo, pattern=r"^studio_go\|catalogo$"))
-    app.add_handler(CallbackQueryHandler(callback_troca, pattern=r"^trade\|"))
+    app.add_handler(CallbackQueyHandler(callback_troca, pattern=r"^trade\|"))
     app.add_handler(CallbackQueryHandler(callback_troca_ui, pattern=r"^tradeui\|"))
     app.add_handler(CallbackQueryHandler(callback_doarui, pattern=r"^doarui\|"))
     app.add_handler(CallbackQueryHandler(callback_wishlist, pattern=r"^wish\|"))
