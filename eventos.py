@@ -296,7 +296,7 @@ class GerenciadorEventos:
 
     async def _preview_teste(self, q, event_id, cat_id, sub_id):
         conn = self._db(); cur = conn.cursor()
-        sql = "SELECT c.nome,c.tier,c.file_id,c.media_type FROM cartas c WHERE c.event_id=%s"
+        sql = "SELECT c.id,c.nome,c.tier,c.file_id,c.media_type FROM cartas c WHERE c.event_id=%s"
         params = [event_id]
         if cat_id:
             sql += " AND c.categoria_id=%s"; params.append(cat_id)
@@ -307,11 +307,13 @@ class GerenciadorEventos:
         if not row:
             await q.answer("Nenhuma carta de evento nessa seleção.", show_alert=True); return
         await q.answer("Prévia de teste — nenhum giro foi consumido.")
-        texto = f"🧪 <b>Teste do evento</b>\nCarta de exemplo: <b>{self._esc(row[0])}</b> • {self._esc(self.d['tier_nome'](row[1]))}"
-        if row[3] == "animation":
-            await q.message.reply_animation(row[2], caption=texto, parse_mode="HTML")
+        texto = f"🧪 <b>Teste do evento</b>\nCarta de exemplo: <b>{self._esc(row[1])}</b> • {self._esc(self.d['tier_nome'](row[2]))}"
+        tags=self.d.get("tags_por_carta",lambda ids:{})([row[0]]).get(row[0],[])
+        if tags: texto += "\n🏷️ <b>Tags:</b> " + ", ".join(f"#{self._esc(tag)}" for tag in tags)
+        if row[4] == "animation":
+            await q.message.reply_animation(row[3], caption=texto, parse_mode="HTML")
         else:
-            await q.message.reply_photo(row[2], caption=texto, parse_mode="HTML")
+            await q.message.reply_photo(row[3], caption=texto, parse_mode="HTML")
 
     async def cmd_natal_presente(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user; msg = update.effective_message
