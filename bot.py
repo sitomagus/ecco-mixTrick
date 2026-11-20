@@ -2426,6 +2426,13 @@ async def cmd_catalogo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verificar_usuario(user.id, user.username)
 
+    # Aceita busca direta, por exemplo: /catalogo Kuru ou /cartas Kuru.
+    termo = " ".join(context.args or []).strip()
+    if termo:
+        context.user_data["catalogo_search_owner"] = user.id
+        await _mostrar_busca_catalogo(update.effective_message, context, termo, 0)
+        return
+
     if update.callback_query:
         await update.callback_query.answer()
 
@@ -2462,10 +2469,10 @@ async def _mostrar_busca_catalogo(target, context, busca: str, page: int = 0):
     page_size=10; conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT COUNT(*) FROM cartas WHERE nome ILIKE %s",(f"%{busca}%",)); total=cur.fetchone()[0]
     pages=max(1,(total+page_size-1)//page_size); page=max(0,min(page,pages-1))
-    cur.execute("SELECT id,nome,tier FROM cartas WHERE nome ILIKE %s ORDER BY nome,tier,id LIMIT %s OFFSET %s",(f"%{busca}%",page_size,page*page_size)); rows=cur.fetchall(); cur.close(); conn.close()
+    cur.execute("SELECT c.id,c.nome,c.tier,e.nome FROM cartas c LEFT JOIN eventos e ON e.id=c.event_id WHERE c.nome ILIKE %s ORDER BY c.nome,c.tier,c.id LIMIT %s OFFSET %s",(f"%{busca}%",page_size,page*page_size)); rows=cur.fetchall(); cur.close(); conn.close()
     context.user_data["catalogo_search_query"]=busca
     uid=target.from_user.id if hasattr(target,"from_user") else context.user_data.get("catalogo_search_owner")
-    buttons=[[InlineKeyboardButton(f"#{cid} {nome[:30]} · T{tier}",callback_data=f"catlist|carta|{cid}|{uid}")] for cid,nome,tier in rows]
+    buttons=[[InlineKeyboardButton(f"#{cid} {nome[:30]} · {evento or f'Tier {tier}' }",callback_data=f"catlist|carta|{cid}|{uid}")] for cid,nome,tier,evento in rows]
     nav=[]
     if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"catlist|searchpage|{page-1}|{uid}"))
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data=f"catlist|noop|{uid}"))
@@ -2660,11 +2667,12 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub
     offset = page * CAT_PAGE_SIZE
 
     cur.execute(f"""
-        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome, subsub.nome
+        SELECT c.id, c.nome, c.tier, cat.nome, sub.nome, subsub.nome, e.nome
         FROM cartas c
         JOIN categorias cat ON c.categoria_id = cat.id
         LEFT JOIN subcategorias sub ON c.subcategoria_id = sub.id
         LEFT JOIN subsubcategorias subsub ON c.subsubcategoria_id = subsub.id
+        LEFT JOIN eventos e ON e.id = c.event_id
         {where_sql}
         ORDER BY c.nome ASC, c.tier ASC, c.id ASC
         LIMIT %s OFFSET %s
@@ -2683,15 +2691,16 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub
         f"📜 <b>Catálogo — {titulo}</b>",
         f"📦 <b>{total}</b> cartas | Página <b>{page + 1}/{total_paginas}</b>\n",
     ]
-    for cid, nome, tier, c_nome, s_nome, ss_nome in rows:
+    for cid, nome, tier, c_nome, s_nome, ss_nome, evento_nome in rows:
         t_cfg = TIERS_CONFIG[tier]
-        t_em = obter_emoji_tier(tier)
+        t_em = "🎄" if evento_nome else obter_emoji_tier(tier)
         marca = " ✅" if cid in possuidas else ""
         extra_local = ""
         if cat_alvo == "all" or (subsub_alvo == "all" and ss_nome):
             _, loc = formatar_local_carta(0, c_nome, None, s_nome, None, ss_nome)
             extra_local = f" <i>({loc})</i>"
-        linhas.append(f"{t_em} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{t_cfg['curto']}</i>{extra_local}{marca}")
+        rotulo_tier = f"Evento: {esc(evento_nome)}" if evento_nome else t_cfg["curto"]
+        linhas.append(f"{t_em} <code>#{cid}</code> <b>{esc(nome)}</b> — <i>{rotulo_tier}</i>{extra_local}{marca}")
 
     botoes = []
     nav = []
@@ -2702,7 +2711,7 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub
     if nav:
         botoes.append(nav)
 
-    for cid,nome,tier,c_nome,s_nome,ss_nome in rows:
+    for cid,nome,tier,c_nome,s_nome,ss_nome,evento_nome in rows:
         tags_text=_texto_tags([cid],tags_por_carta)
         if tags_text: linhas.append(f"  {tags_text}")
 
@@ -3843,17 +3852,20 @@ async def _enviar_carta_por_id(target, user_id: int, carta_id: int, bot):
     conn=get_db(); cur=conn.cursor()
     cur.execute("""
         SELECT c.id,c.nome,cat.id,cat.nome,sub.id,sub.nome,subsub.id,subsub.nome,c.tier,c.file_id,c.media_type,
+               e.nome,
                COALESCE((SELECT SUM(i.quantidade) FROM inventario i WHERE i.user_id=%s AND i.carta_id=c.id),0)
         FROM cartas c JOIN categorias cat ON cat.id=c.categoria_id
         LEFT JOIN subcategorias sub ON sub.id=c.subcategoria_id
-        LEFT JOIN subsubcategorias subsub ON subsub.id=c.subsubcategoria_id WHERE c.id=%s
+        LEFT JOIN subsubcategorias subsub ON subsub.id=c.subsubcategoria_id
+        LEFT JOIN eventos e ON e.id=c.event_id WHERE c.id=%s
     """,(user_id,carta_id)); row=cur.fetchone(); cur.close(); conn.close()
     if not row:
         message=target.message if hasattr(target,"message") else target
         await message.reply_text("Carta não encontrada."); return
-    cid,nome,cid_cat,cat_nome,sid,sub_nome,ssid,subsub_nome,tier,file_id,media_type,owned=row
+    cid,nome,cid_cat,cat_nome,sid,sub_nome,ssid,subsub_nome,tier,file_id,media_type,event_name,owned=row
     codigo,local=formatar_local_carta(cid_cat,cat_nome,sid,sub_nome,ssid,subsub_nome)
-    caption=(f"{obter_emoji_tier(tier)} <b>{cid}. {esc(nome)}</b> · Tier {tier}\n"
+    label = f"🎄 Evento: {esc(event_name)}" if event_name else f"{obter_emoji_tier(tier)} Tier {tier}"
+    caption=(f"{label} · <b>{cid}. {esc(nome)}</b>\n"
              f"💿 <b>{codigo}. {esc(local)}</b>\n♻️ Você possui: <b>{int(owned or 0)}</b>")
     tags_text=_texto_tags([cid])
     if tags_text: caption += "\n"+tags_text
@@ -3870,10 +3882,10 @@ async def cmd_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if term.isdigit():
         await _enviar_carta_por_id(msg,user.id,int(term),context.bot); return
     conn=get_db(); cur=conn.cursor()
-    cur.execute("SELECT id,nome,tier FROM cartas WHERE nome ILIKE %s ORDER BY nome,tier,id LIMIT 10",(f"%{term}%",)); rows=cur.fetchall(); cur.close(); conn.close()
+    cur.execute("SELECT c.id,c.nome,c.tier,e.nome FROM cartas c LEFT JOIN eventos e ON e.id=c.event_id WHERE c.nome ILIKE %s ORDER BY c.nome,c.tier,c.id LIMIT 10",(f"%{term}%",)); rows=cur.fetchall(); cur.close(); conn.close()
     if not rows:
         await msg.reply_text(f"Não encontrei cartas com <b>{esc(term)}</b>.",parse_mode="HTML"); return
-    buttons=[[InlineKeyboardButton(f"#{cid} {nome[:30]} · T{tier}",callback_data=f"carta|id|{cid}|{user.id}")] for cid,nome,tier in rows]
+    buttons=[[InlineKeyboardButton(f"#{cid} {nome[:30]} · {evento or f'Tier {tier}'}",callback_data=f"carta|id|{cid}|{user.id}")] for cid,nome,tier,evento in rows]
     await msg.reply_text(f"Resultados para <b>{esc(term)}</b>. Escolha a versão da carta:",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
 
 async def callback_carta_busca(update: Update, context: ContextTypes.DEFAULT_TYPE):
