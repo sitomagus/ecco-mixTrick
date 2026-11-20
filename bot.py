@@ -32,10 +32,11 @@ DATABASE_URL = os.environ["DATABASE_URL"].strip()
 WEBHOOK_URL = os.environ["WEBHOOK_URL"].strip().rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
 
-SUPER_ADMINS = [8622687849]
-env_admins = os.environ.get("ADMIN_IDS", "")
-if env_admins:
-    SUPER_ADMINS.extend([int(x.strip()) for x in env_admins.split(",") if x.strip().isdigit()])
+try:
+    SUPER_ADMIN_ID = int(os.environ["SUPER_ADMIN_ID"].strip())
+except (KeyError, ValueError) as exc:
+    raise RuntimeError("Configure SUPER_ADMIN_ID nas variáveis de ambiente do Render.") from exc
+SUPER_ADMINS = [SUPER_ADMIN_ID]
 
 GIROS_DIARIOS = 10
 FUSO_GIROS = ZoneInfo("America/Sao_Paulo")
@@ -3916,7 +3917,7 @@ async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def montar_teclado_categorias():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT id, nome FROM categorias ORDER BY id ASC")
+    cur.execute("SELECT id, nome FROM categorias WHERE event_id IS NULL ORDER BY id ASC")
     cats = cur.fetchall()
     cur.close()
     conn.close()
@@ -4034,12 +4035,16 @@ def montar_teclado_nomes(context: ContextTypes.DEFAULT_TYPE):
     botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="wiz_cancel")])
     return InlineKeyboardMarkup(botoes)
 
-async def wiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _wiz_start_common(update: Update, context: ContextTypes.DEFAULT_TYPE, event_id=None, event_name=None):
     if not eh_admin(update.effective_user.id):
         return ConversationHandler.END
 
     context.user_data.clear()
     context.user_data["admin_id"] = update.effective_user.id
+    context.user_data["event_id"] = context.user_data.get("event_context_id", event_id)
+    if event_id is not None:
+        context.user_data["event_context_id"] = event_id
+        context.user_data["event_name"] = event_name or "evento"
 
     texto = "💿 <b>Nova Carta — Passo 1/5</b>\n\nEscolha a <b>categoria</b> ou crie uma nova:"
     markup = montar_teclado_categorias()
@@ -4050,6 +4055,34 @@ async def wiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.effective_message.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return ST_CAT
+
+async def wiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        event_key=" ".join(context.args).strip()
+        conn=get_db(); cur=conn.cursor(); cur.execute("SELECT id,nome FROM eventos WHERE LOWER(slug)=LOWER(%s) OR LOWER(nome)=LOWER(%s) ORDER BY id LIMIT 1",(event_key.lower().replace(" ","_"),event_key)); event=cur.fetchone(); cur.close(); conn.close()
+        if event: return await _wiz_start_common(update,context,event[0],event[1])
+    return await _wiz_start_common(update, context)
+
+async def wiz_start_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if not q or not eh_admin(q.from_user.id):
+        if q: await q.answer("Apenas administradores podem cadastrar cartas de evento.",show_alert=True)
+        return ConversationHandler.END
+    event_id=int(q.data.split("|")[-1]); conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT nome FROM eventos WHERE id=%s",(event_id,)); row=cur.fetchone(); cur.close(); conn.close()
+    if not row:
+        await q.answer("Evento não encontrado.",show_alert=True); return ConversationHandler.END
+    return await _wiz_start_common(update,context,event_id,row[0])
+
+async def wiz_start_event_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_admin(update.effective_user.id): return ConversationHandler.END
+    raw=update.effective_message.text or ""
+    match=re.match(r"(?i)^\s*/addcarta[-_]([\w-]+)(?:@[\w]+)?(?:\s|$)",raw)
+    slug=match.group(1).lower().replace("-","_") if match else " ".join(context.args).strip().lower().replace(" ","_")
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT id,nome FROM eventos WHERE LOWER(slug)=LOWER(%s) OR LOWER(nome)=LOWER(%s) ORDER BY id LIMIT 1",(slug,slug)); row=cur.fetchone(); cur.close(); conn.close()
+    if not row:
+        await update.effective_message.reply_text("Não encontrei esse evento. Abra /eventos e use o botão de cadastro de cartas."); return ConversationHandler.END
+    return await _wiz_start_common(update,context,row[0],row[1])
 
 async def wiz_start_add_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
@@ -4082,6 +4115,10 @@ async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("SELECT nome, event_id FROM categorias WHERE id = %s", (cat_id,))
     cat_nome, event_id = cur.fetchone()
+    if event_id is not None:
+        cur.close(); conn.close()
+        await query.answer("Selecione uma categoria normal do catálogo.",show_alert=True)
+        return ST_CAT
     cur.execute("SELECT COUNT(*) FROM subcategorias WHERE categoria_id = %s", (cat_id,))
     tem_subs = cur.fetchone()[0] > 0
     cur.close()
@@ -4089,7 +4126,7 @@ async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["cat_id"] = cat_id
     context.user_data["cat_nome"] = cat_nome
-    context.user_data["event_id"] = event_id
+    context.user_data["event_id"] = context.user_data.get("event_context_id", event_id)
     context.user_data["sub_id"] = None
     context.user_data["sub_nome"] = None
     context.user_data["subsub_id"] = None
@@ -4382,10 +4419,10 @@ async def wiz_escolher_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*) FROM cartas
-        WHERE LOWER(nome) = LOWER(%s) AND categoria_id = %s
+        WHERE LOWER(nome) = LOWER(%s) AND event_id IS NOT DISTINCT FROM %s AND categoria_id = %s
           AND subcategoria_id IS NOT DISTINCT FROM %s
           AND subsubcategoria_id IS NOT DISTINCT FROM %s
-    """, (nome_escolhido, context.user_data["cat_id"], context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
+    """, (nome_escolhido, context.user_data.get("event_id"), context.user_data["cat_id"], context.user_data.get("sub_id"), context.user_data.get("subsub_id")))
     total_tiers = cur.fetchone()[0]
     modo_tiers = categoria_usa_tiers(context.user_data["cat_id"])
     cur.close()
@@ -6812,7 +6849,8 @@ async def cmd_del_carta(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Carta não encontrada.")
 
 async def cmd_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await bloqueio_nao_admin(update):
+    if update.effective_user.id != SUPER_ADMIN_ID:
+        await update.effective_message.reply_text("Somente o administrador principal pode zerar o histórico de cartas de todos.")
         return
     teclado = InlineKeyboardMarkup([
         [
@@ -6827,8 +6865,8 @@ async def cmd_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not eh_admin(query.from_user.id):
-        await query.answer("Apenas administradores podem fazer isso.", show_alert=True)
+    if query.from_user.id != SUPER_ADMIN_ID:
+        await query.answer("Somente o administrador principal pode zerar o histórico de cartas de todos.", show_alert=True)
         return
     if query.data == "deleteall|cancel":
         await query.answer("Cancelado.")
@@ -7374,6 +7412,7 @@ async def cmd_dar_giros(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_add_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
+        await update.effective_message.reply_text("Somente o administrador principal pode alterar as funções da equipe.")
         return
 
     try:
@@ -7395,6 +7434,7 @@ async def cmd_add_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_add_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
+        await update.effective_message.reply_text("Somente o administrador principal pode alterar as funções da equipe.")
         return
     try:
         target_id = int(context.args[0])
@@ -7412,6 +7452,7 @@ async def cmd_ver_adms(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_rem_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
+        await update.effective_message.reply_text("Somente o administrador principal pode alterar as funções da equipe.")
         return
 
     try:
@@ -7468,8 +7509,10 @@ async def main():
     # Assistente interativo /addcarta (com 3 níveis)
     conv_carta = ConversationHandler(
         entry_points=[
+            MessageHandler(filters.COMMAND & filters.Regex(r"^/addcarta[-_].+"), wiz_start_event_command),
             CommandHandler("addcarta", wiz_start),
             CallbackQueryHandler(wiz_start, pattern=r"^studio_go\|addcarta$"),
+            CallbackQueryHandler(wiz_start_event, pattern=r"^studio_go\|addevent\|\d+$"),
             CallbackQueryHandler(wiz_start_add_tier, pattern=r"^studio_go\|addtier\|"),
         ],
         states={
