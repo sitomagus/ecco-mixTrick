@@ -4145,8 +4145,8 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t_em = obter_emoji_tier(tier)
     cat_codigo, local_str = formatar_local_carta(cat_id, cat_nome, sub_id, sub_nome, subsub_id, subsub_nome)
     await query.message.reply_text(
-        f"✅ <b>Carta cadastrada com sucesso!</b>\n\n"
-        (f"🎉 <b>{nova_id}. {esc(nome_carta)}</b> • carta de evento\n" if event_id else f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n")
+        f"✅ <b>Carta cadastrada com sucesso!</b>\n\n" +
+        (f"🎉 <b>{nova_id}. {esc(nome_carta)}</b> • carta de evento\n" if event_id else f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n") +
         f"💿 <b>{cat_codigo}. {local_str}</b>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Cadastrar outra carta", callback_data="studio_go|addcarta")],
