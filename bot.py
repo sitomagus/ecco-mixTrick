@@ -282,6 +282,19 @@ MV_ARTIST_NAME = 40
 def esc(texto: str) -> str:
     return html.escape(str(texto), quote=False)
 
+def _tags_por_carta(carta_ids: list[int]) -> dict[int, list[str]]:
+    ids=list({int(cid) for cid in carta_ids if cid is not None})
+    if not ids: return {}
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT ct.carta_id,ARRAY_AGG(t.nome ORDER BY LOWER(t.nome)) FROM carta_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.carta_id=ANY(%s) GROUP BY ct.carta_id",(ids,))
+    result={cid:names for cid,names in cur.fetchall()}; cur.close(); conn.close()
+    return result
+
+def _texto_tags(carta_ids: list[int], tags_map: dict[int,list[str]] | None = None) -> str:
+    tags_map=tags_map if tags_map is not None else _tags_por_carta(carta_ids)
+    names=sorted({tag for cid in carta_ids for tag in tags_map.get(int(cid),[])},key=str.lower)
+    return "🏷️ <b>Tags:</b> " + ", ".join(f"#{esc(name)}" for name in names) if names else ""
+
 def texto_limpo_botao(html_str: str) -> str:
     """Remove tags HTML (como <tg-emoji>) para exibir em botões inline."""
     return re.sub(r"<[^>]+>", "", str(html_str))
@@ -555,6 +568,27 @@ def iniciar_banco():
             tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
             PRIMARY KEY (carta_id, tag_id)
         );
+        CREATE TABLE IF NOT EXISTS pedidos_casamento (
+            id SERIAL PRIMARY KEY,
+            proponente_id BIGINT NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+            destinatario_id BIGINT NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+            chat_id BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','aceito','recusado','cancelado')),
+            criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS casamentos (
+            id SERIAL PRIMARY KEY,
+            usuario_a BIGINT NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+            usuario_b BIGINT NOT NULL REFERENCES usuarios(user_id) ON DELETE CASCADE,
+            chat_id BIGINT,
+            ativo BOOLEAN NOT NULL DEFAULT TRUE,
+            criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            encerrado_em TIMESTAMPTZ,
+            CHECK (usuario_a < usuario_b)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_casamento_ativo_a ON casamentos(usuario_a) WHERE ativo;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_casamento_ativo_b ON casamentos(usuario_b) WHERE ativo;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pedido_casamento_pendente ON pedidos_casamento(proponente_id,destinatario_id) WHERE status='pendente';
         CREATE TABLE IF NOT EXISTS inventario (
             id SERIAL PRIMARY KEY,
             user_id BIGINT REFERENCES usuarios(user_id),
@@ -991,6 +1025,8 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     comandos_novos = [
         ("/tag", "• /tag nome — Ver Minha coleção e Catálogo filtrados por tag"),
         ("/col", "• /col tag — Ver sua coleção filtrada por tag"),
+        ("/casar", "• /casar @pessoa — Propor casamento para outro jogador"),
+        ("/divorciar", "• /divorciar — Encerrar seu casamento atual"),
         ("/perfil", "• /perfil [@pessoa] — Ver e editar seu perfil, XP e carta favorita"),
         ("/carta", "• /carta ID ou nome — Ver uma carta e consultar quantas cópias você possui"),
         ("/eventos", "• /eventos — Abrir eventos ativos e suas cartas especiais"),
@@ -1077,12 +1113,101 @@ async def _buscar_usuario_perfil(identificador: str):
     row = cur.fetchone(); cur.close(); conn.close()
     return row[0] if row else None
 
+async def _propor_casamento(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
+    proposer=update.effective_user; msg=update.effective_message
+    if not proposer or not msg: return
+    if target_id==proposer.id:
+        await msg.reply_text("Você não pode propor casamento a si mesmo."); return
+    verificar_usuario(proposer.id,proposer.username)
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT user_id,casado_com FROM usuarios WHERE user_id=ANY(%s) ORDER BY user_id",([proposer.id,target_id],)); rows=cur.fetchall()
+    married={uid:partner for uid,partner in rows}
+    if target_id not in married:
+        cur.close(); conn.close(); await msg.reply_text("Essa pessoa precisa iniciar o bot antes de receber propostas."); return
+    if married.get(proposer.id) or married.get(target_id):
+        cur.close(); conn.close(); await msg.reply_text("Uma das pessoas já está em um casamento. Para encerrar, use /divorciar."); return
+    cur.execute("SELECT id FROM pedidos_casamento WHERE proponente_id=%s AND destinatario_id=%s AND status='pendente'",(proposer.id,target_id)); pending=cur.fetchone()
+    if pending:
+        cur.close(); conn.close(); await msg.reply_text("Você já enviou uma proposta que ainda está aguardando resposta."); return
+    cur.execute("INSERT INTO pedidos_casamento(proponente_id,destinatario_id,chat_id) VALUES(%s,%s,%s) RETURNING id",(proposer.id,target_id,msg.chat_id)); proposal_id=cur.fetchone()[0]
+    cur.execute("SELECT apelido,username FROM usuarios WHERE user_id=%s",(proposer.id,)); who=cur.fetchone(); conn.commit(); cur.close(); conn.close()
+    sender=(who[0] or (f"@{who[1]}" if who and who[1] else f"Mixer #{str(proposer.id)[-4:]}")) if who else "Alguém"
+    keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("💍 Aceitar",callback_data=f"casar|aceitar|{proposal_id}"),InlineKeyboardButton("🙅 Recusar",callback_data=f"casar|recusar|{proposal_id}")]])
+    text=f"💌 <b>Proposta de casamento</b>\n{esc(sender)} quer se casar com você."
+    try:
+        await context.bot.send_message(chat_id=target_id,text=text,reply_markup=keyboard,parse_mode="HTML")
+        await msg.reply_text("💌 Proposta enviada no privado. A pessoa pode aceitar ou recusar por lá.")
+    except Exception:
+        await context.bot.send_message(chat_id=msg.chat_id,text=text,reply_markup=keyboard,parse_mode="HTML")
+        await msg.reply_text("💌 Não consegui enviar no privado; deixei a proposta aqui no chat.")
+
+async def cmd_casar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message; user=update.effective_user
+    if not msg or not user: return
+    alvo=" ".join(context.args).strip()
+    if not alvo and msg.reply_to_message and msg.reply_to_message.from_user:
+        alvo=str(msg.reply_to_message.from_user.id)
+    if not alvo:
+        await msg.reply_text("Use <code>/casar @pessoa</code> ou responda à mensagem dela com <code>/casar</code>.",parse_mode="HTML"); return
+    target_id=await _buscar_usuario_perfil(alvo)
+    if not target_id:
+        await msg.reply_text("Não encontrei essa pessoa. Ela precisa iniciar o bot com /start."); return
+    await _propor_casamento(update,context,target_id)
+
+async def callback_casamento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; _,action,proposal_raw=q.data.split("|"); proposal_id=int(proposal_raw)
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT proponente_id,destinatario_id,chat_id,status FROM pedidos_casamento WHERE id=%s FOR UPDATE",(proposal_id,)); proposal=cur.fetchone()
+    if not proposal:
+        conn.rollback(); cur.close(); conn.close(); await q.answer("Proposta não encontrada.",show_alert=True); return
+    proposer,target,origin_chat,status=proposal
+    if q.from_user.id!=target:
+        conn.rollback(); cur.close(); conn.close(); await q.answer("Só o destinatário pode responder a esta proposta.",show_alert=True); return
+    if status!="pendente":
+        conn.rollback(); cur.close(); conn.close(); await q.answer("Essa proposta já foi respondida.",show_alert=True); return
+    if action=="recusar":
+        cur.execute("UPDATE pedidos_casamento SET status='recusado' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
+        await q.answer("Proposta recusada."); await q.edit_message_text("🙅 Você recusou a proposta de casamento.")
+        texto="🙅 A proposta de casamento foi recusada."
+    else:
+        cur.execute("SELECT user_id,casado_com FROM usuarios WHERE user_id=ANY(%s) ORDER BY user_id FOR UPDATE",([proposer,target],)); users=cur.fetchall(); pairs={uid:partner for uid,partner in users}
+        if len(users)<2 or pairs.get(proposer) or pairs.get(target):
+            cur.execute("UPDATE pedidos_casamento SET status='cancelado' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
+            await q.answer("Uma das pessoas já se casou; proposta cancelada.",show_alert=True); await q.edit_message_text("Essa proposta foi cancelada porque uma das pessoas já está casada."); return
+        a,b=sorted((proposer,target))
+        cur.execute("UPDATE usuarios SET casado_com=CASE WHEN user_id=%s THEN %s ELSE %s END WHERE user_id=ANY(%s)",(proposer,target,proposer,[proposer,target]))
+        cur.execute("INSERT INTO casamentos(usuario_a,usuario_b,chat_id) VALUES(%s,%s,%s)",(a,b,origin_chat))
+        cur.execute("UPDATE pedidos_casamento SET status='aceito' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
+        await q.answer("Vocês agora estão casados! 💍"); await q.edit_message_text("💍 Proposta aceita! Vocês agora estão casados.")
+        texto="💍 <b>Casamento confirmado!</b> Parabéns ao novo casal!"
+    await _notificar_casamento(context.bot,proposer,target,origin_chat,texto)
+
+async def _notificar_casamento(bot, user_a: int, user_b: int, chat_id: int | None, texto: str):
+    for uid in {user_a,user_b}:
+        try: await bot.send_message(chat_id=uid,text=texto,parse_mode="HTML")
+        except Exception: pass
+    if chat_id and chat_id not in {user_a,user_b}:
+        try: await bot.send_message(chat_id=chat_id,text=texto,parse_mode="HTML")
+        except Exception: pass
+
+async def cmd_divorciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user=update.effective_user; msg=update.effective_message
+    if not user or not msg: return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT casado_com FROM usuarios WHERE user_id=%s FOR UPDATE",(user.id,)); row=cur.fetchone()
+    partner=row[0] if row else None
+    if not partner:
+        conn.rollback(); cur.close(); conn.close(); await msg.reply_text("Seu perfil não mostra um casamento ativo."); return
+    a,b=sorted((user.id,partner)); cur.execute("SELECT chat_id FROM casamentos WHERE usuario_a=%s AND usuario_b=%s AND ativo=TRUE ORDER BY id DESC LIMIT 1",(a,b)); marriage=cur.fetchone(); group_chat=marriage[0] if marriage else msg.chat_id
+    cur.execute("UPDATE usuarios SET casado_com=NULL WHERE user_id=ANY(%s)",([user.id,partner],))
+    cur.execute("UPDATE casamentos SET ativo=FALSE,encerrado_em=NOW() WHERE usuario_a=%s AND usuario_b=%s AND ativo=TRUE",(a,b)); conn.commit(); cur.close(); conn.close()
+    await msg.reply_text("💔 Casamento encerrado.")
+    await _notificar_casamento(context.bot,user.id,partner,group_chat,"💔 O casamento foi encerrado.")
+
 async def _renderizar_perfil(user_id: int):
     conn = get_db(); cur = conn.cursor()
     cur.execute("""
         SELECT u.apelido,u.username,u.bio,u.xp,u.musica_favorita,u.casado_com,
                COALESCE((SELECT SUM(i.quantidade) FROM inventario i WHERE i.user_id=u.user_id),0),
-               fc.nome,fc.tier,par.apelido,par.username
+               fc.id,fc.nome,fc.tier,par.apelido,par.username
         FROM usuarios u
         LEFT JOIN cartas fc ON fc.id=u.carta_favorita_id
         LEFT JOIN usuarios par ON par.user_id=u.casado_com
@@ -1091,12 +1216,13 @@ async def _renderizar_perfil(user_id: int):
     row = cur.fetchone(); cur.close(); conn.close()
     if not row:
         return None, None
-    apelido, username, bio, xp, musica, parceiro_id, total_cartas, carta_nome, carta_tier, parceiro_apelido, parceiro_username = row
+    apelido, username, bio, xp, musica, parceiro_id, total_cartas, carta_id, carta_nome, carta_tier, parceiro_apelido, parceiro_username = row
     display = (apelido or "").strip() or (f"@{username}" if username else f"Mixer #{str(user_id)[-4:]}")
     nivel = int(xp or 0) // 100 + 1
     progresso = int(xp or 0) % 100
     parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else "Solteiro(a)"
     carta = f"{carta_nome} [Tier {carta_tier}]" if carta_nome else "Não definida"
+    carta_tags=_texto_tags([carta_id]) if carta_id else ""
     texto = (
         f"⠀⢏⢢⣀⡔⡹  ⊹   <b>{esc(display)}</b>\n"
         f"💧 : {esc(bio.strip() if bio and bio.strip() else 'Bio não definida')}\n"
@@ -1104,7 +1230,7 @@ async def _renderizar_perfil(user_id: int):
         f"🖥 : Nível {nivel} · {int(xp or 0)} XP ({progresso}/100 para o próximo nível)\n"
         f"🌱 : {esc(musica.strip() if musica and musica.strip() else 'Música favorita não definida')}\n"
         f"🫧 : {esc(parceiro)}\n\n"
-        f"🖱 : {esc(carta)}"
+        f"🖱 : {esc(carta)}" + (f"\n{carta_tags}" if carta_tags else "")
     )
     return texto, carta_nome
 
@@ -1122,6 +1248,8 @@ async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
             [InlineKeyboardButton("💧 Editar bio", callback_data="perfil|editar|bio"), InlineKeyboardButton("🌱 Música favorita", callback_data="perfil|editar|musica")],
             [InlineKeyboardButton("🖱 Escolher carta favorita", callback_data="perfil|buscarcarta")],
         ])
+    else:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("💍 Propor casamento",callback_data=f"perfil|casar|{user_id}")]])
     if hasattr(target, "reply_text"):
         await target.reply_text(texto, parse_mode="HTML", reply_markup=markup)
     else:
@@ -1150,6 +1278,11 @@ async def cmd_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; partes = q.data.split("|")
     dono = context.user_data.get("perfil_visualizado")
+    if partes[1]=="casar":
+        target_id=int(partes[2])
+        if dono!=target_id or target_id==q.from_user.id:
+            await q.answer("Abra o perfil da pessoa que deseja convidar.",show_alert=True); return
+        await q.answer(); await _propor_casamento(update,context,target_id); return
     if dono != q.from_user.id:
         await q.answer("Abra seu próprio /perfil para editar.", show_alert=True); return
     acao = partes[1]
@@ -1812,6 +1945,7 @@ async def _processar_giros_core(
         # Agrupa as cartas sorteadas para atualizar o inventário em poucas queries
         mapa_cartas = {c[0]: c for c in cartas}
         contagem_sorteio = Counter(c[0] for c in sorteadas)
+        tags_por_carta = _tags_por_carta(list(contagem_sorteio.keys()))
 
         cur.execute(
             "SELECT id, carta_id, quantidade FROM inventario WHERE user_id = %s AND carta_id = ANY(%s)",
@@ -1888,6 +2022,8 @@ async def _processar_giros_core(
             if tier == 6:
                 legenda += "\n\n💠 <b>SS+ ultra raro!</b> Você pode vender esta carta na loja por <b>1.000 EccoCoins</b>."
 
+            tags_text=_texto_tags([carta_id],tags_por_carta)
+            if tags_text: legenda += "\n"+tags_text
             await enviar_midia_carta(reply_anchor, file_id, media_type, legenda, bot=bot)
             await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id)
         else:
@@ -1928,6 +2064,8 @@ async def _processar_giros_core(
                     vezes_txt=vezes_txt,
                     tag_nova=tag_nova,
                 ))
+                tags_text=_texto_tags([cid],tags_por_carta)
+                if tags_text: linhas.append(tags_text)
                 if c_tier == 6:
                     linhas.append("💠 <b>SS+ ultra raro!</b> Cada carta SS+ pode ser vendida por <b>1.000 EccoCoins</b> na loja.")
 
@@ -2367,6 +2505,7 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub
     possuidas = {r[0] for r in cur.fetchall()}
     cur.close()
     conn.close()
+    tags_por_carta = _tags_por_carta([r[0] for r in rows])
 
     await query.answer()
 
@@ -2392,6 +2531,10 @@ async def _renderizar_lista_catalogo(query, cat_alvo: str, sub_alvo: str, subsub
         nav.append(InlineKeyboardButton("Próxima ➡️", callback_data=f"catlist|view|{cat_alvo}|{sub_alvo}|{subsub_alvo}|{page + 1}|{user_id}"))
     if nav:
         botoes.append(nav)
+
+    for cid,nome,tier,c_nome,s_nome,ss_nome in rows:
+        tags_text=_texto_tags([cid],tags_por_carta)
+        if tags_text: linhas.append(f"  {tags_text}")
 
     rodape = []
     if sub_alvo != "all" and tem_subsubs_na_sub:
@@ -2492,6 +2635,10 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             linhas.append(f"{t_em} <b>{t_cfg['nome']}:</b> ➖ <i>(Não cadastrada)</i>")
 
+    tags_por_carta=_tags_por_carta(list(mapa_tiers.values()))
+    for cid in mapa_tiers.values():
+        tags_text=_texto_tags([cid],tags_por_carta)
+        if tags_text: linhas.append(f"  #{cid} · {tags_text}")
     botoes = [[InlineKeyboardButton("🏆 Ver Ranking deste Artista", callback_data=f"rank_cid|{primeiro_cid}")]]
     await msg.reply_text("\n".join(linhas), reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
@@ -2552,6 +2699,7 @@ async def _mostrar_colecao(target, user_id: int, username: str | None = None, pa
     rows=cur.fetchall()
     cur.execute("SELECT LOWER(nome),COUNT(*) FROM cartas GROUP BY LOWER(nome)")
     total_tiers=dict(cur.fetchall()); cur.close(); conn.close()
+    tags_por_carta=_tags_por_carta([row[0] for row in rows])
     apelido,_=obter_apelido(user_id,username or "")
     if not rows:
         text=f"Sua coleção está vazia. Use /girar para pegar sua primeira carta!"
@@ -2566,6 +2714,8 @@ async def _mostrar_colecao(target, user_id: int, username: str | None = None, pa
             n_total=total_tiers.get(name.lower(),len(variants))
             versions=", ".join(f"T{t} (<code>#{cid}</code> ×{qty})" for cid,t,qty in variants)
             lines.append(f"<b>{esc(name)}</b> [{len(variants)}/{n_total}]: {versions}")
+            tags_text=_texto_tags([cid for cid,_,_ in variants],tags_por_carta)
+            if tags_text: lines.append(f"  {tags_text}")
         lines.append("\n<i>Use /artista nome ou /ranking nome para ver progresso e ranking.</i>")
         buttons=[]
         if pages>1:
@@ -2631,6 +2781,10 @@ async def callback_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows=cur.fetchall(); cur.close(); conn.close(); size=8; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1)); rows_page=rows[page*size:(page+1)*size]
     lines=[f"📚 <b>Catálogo da tag {esc(tag)}</b> · {len(rows)} carta(s) · página {page+1}/{pages}\n"]
     lines.extend(f"• <code>#{cid}</code> {esc(name)} (T{tier})" for cid,name,tier,_ in rows_page)
+    tags_by_card=_tags_por_carta([r[0] for r in rows_page])
+    for cid,name,tier,owned in rows_page:
+        tags_text=_texto_tags([cid],tags_by_card)
+        if tags_text: lines.append(f"  {tags_text}")
     for cid,name,tier,owned in rows_page:
         if owned: lines.append(f"  ↳ Você possui {owned}x da carta #{cid}.")
     if not rows: lines.append("Nenhuma carta cadastrada com essa tag.")
@@ -2642,6 +2796,136 @@ async def callback_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"tag|catalog|{tag_id}|{user_id}|{page+1}"))
         buttons.append(nav)
     await q.answer(); await q.edit_message_text("\n".join(lines),parse_mode="HTML",reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
+def _tagadm_apply_names(tag_id: int, names: list[str], remove: bool = False):
+    conn=get_db(); cur=conn.cursor(); changed=0; skipped=[]; missing=[]
+    for name in names:
+        cur.execute("SELECT id FROM cartas WHERE LOWER(TRIM(nome))=LOWER(TRIM(%s))",(name,)); card_ids=[r[0] for r in cur.fetchall()]
+        if not card_ids:
+            missing.append(name); continue
+        if remove:
+            cur.execute("DELETE FROM carta_tags WHERE tag_id=%s AND carta_id=ANY(%s)",(tag_id,card_ids)); changed+=cur.rowcount
+            continue
+        for cid in card_ids:
+            cur.execute("SELECT COUNT(*) FROM carta_tags WHERE carta_id=%s",(cid,)); count=cur.fetchone()[0]
+            cur.execute("SELECT 1 FROM carta_tags WHERE carta_id=%s AND tag_id=%s",(cid,tag_id)); exists=cur.fetchone()
+            if exists: continue
+            if count>=3:
+                skipped.append(name); continue
+            cur.execute("INSERT INTO carta_tags(carta_id,tag_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(cid,tag_id)); changed+=cur.rowcount
+    conn.commit(); cur.close(); conn.close()
+    return changed,sorted(set(skipped),key=str.lower),missing
+
+async def _tagadm_home(target, page: int = 0):
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT t.id,t.nome,COUNT(DISTINCT LOWER(c.nome)) FROM tags t LEFT JOIN carta_tags ct ON ct.tag_id=t.id LEFT JOIN cartas c ON c.id=ct.carta_id GROUP BY t.id,t.nome ORDER BY LOWER(t.nome)")
+    rows=cur.fetchall(); cur.close(); conn.close(); size=10; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1))
+    buttons=[[InlineKeyboardButton(f"🏷️ {name} · {count} nomes",callback_data=f"tagadm|open|{tid}|0")] for tid,name,count in rows[page*size:(page+1)*size]]
+    buttons.append([InlineKeyboardButton("➕ Criar tag",callback_data="tagadm|create")])
+    nav=[]
+    if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"tagadm|home|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="tagadm|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"tagadm|home|{page+1}"))
+    buttons.append(nav)
+    text="🏷️ <b>Gerenciar tags</b>\nEscolha uma tag ou crie uma nova. Você pode aplicar uma tag a vários nomes de uma vez."
+    if hasattr(target,"edit_message_text"): await target.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+    else: await target.reply_text(text,reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+
+async def _tagadm_cards(q, tag_id: int, page: int = 0, search: str | None = None, answer_query: bool = True):
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT nome FROM tags WHERE id=%s",(tag_id,)); tagrow=cur.fetchone()
+    if not tagrow:
+        cur.close(); conn.close(); await q.answer("Tag não encontrada.",show_alert=True); return
+    tag=tagrow[0]
+    args=[tag_id]; where=""
+    if search:
+        where="WHERE c.nome ILIKE %s"; args.append(f"%{search}%")
+    cur.execute(f"SELECT MIN(c.id),MIN(c.nome),COUNT(*),COUNT(ct.carta_id) FROM cartas c LEFT JOIN carta_tags ct ON ct.carta_id=c.id AND ct.tag_id=%s {where} GROUP BY LOWER(c.nome) ORDER BY LOWER(MIN(c.nome))",tuple(args))
+    rows=cur.fetchall(); cur.close(); conn.close(); size=10; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1)); chunk=rows[page*size:(page+1)*size]
+    buttons=[]
+    for cid,name,versions,tagged in chunk:
+        mark="✅" if tagged else "▫️"
+        buttons.append([InlineKeyboardButton(f"{mark} {name[:42]} · {versions} v.",callback_data=f"tagadm|toggle|{tag_id}|{cid}|{page}")])
+    buttons.append([InlineKeyboardButton("📋 Aplicar a lista de nomes",callback_data=f"tagadm|bulk|{tag_id}"),InlineKeyboardButton("➖ Remover por nome",callback_data=f"tagadm|remove|{tag_id}")])
+    buttons.append([InlineKeyboardButton("🔎 Pesquisar nomes",callback_data=f"tagadm|search|{tag_id}")])
+    nav=[]
+    if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"tagadm|open|{tag_id}|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="tagadm|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"tagadm|open|{tag_id}|{page+1}"))
+    buttons.append(nav); buttons.append([InlineKeyboardButton("🔙 Tags",callback_data="tagadm|home|0")])
+    search_label=f"\nPesquisa: <i>{esc(search)}</i>" if search else ""
+    text=f"🏷️ <b>{esc(tag)}</b> · {len(rows)} nomes · página {page+1}/{pages}{search_label}\nMarque ou desmarque os nomes pelos botões; a ação vale para todas as versões do nome."
+    if hasattr(q,"answer"):
+        if answer_query: await q.answer()
+        await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+    else:
+        await q.reply_text(text,reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+
+async def cmd_tags_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_editor(update.effective_user.id):
+        await update.effective_message.reply_text("Apenas a equipe pode gerenciar tags."); return
+    await _tagadm_home(update.effective_message,0)
+
+async def callback_tagadm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; p=q.data.split("|"); action=p[1]
+    if not eh_editor(q.from_user.id):
+        await q.answer("Apenas a equipe.",show_alert=True); return
+    if action=="noop": await q.answer(); return
+    if action=="home": await q.answer(); await _tagadm_home(q,int(p[2])); return
+    if action=="create":
+        context.user_data["tagadm_pending"]={"action":"create"}; await q.answer(); await q.message.reply_text("Digite o nome da tag nova:"); return
+    if action=="open":
+        tag_id=int(p[2]); await _tagadm_cards(q,tag_id,int(p[3]),context.user_data.get(f"tagadm_search:{tag_id}")); return
+    if action=="search":
+        context.user_data["tagadm_pending"]={"action":"search","tag_id":int(p[2])}; await q.answer(); await q.message.reply_text("Digite o nome ou trecho do artista/personagem para filtrar a lista:"); return
+    if action in ("bulk","remove"):
+        context.user_data["tagadm_pending"]={"action":"bulk" if action=="bulk" else "remove_name","tag_id":int(p[2])}
+        await q.answer(); await q.message.reply_text("Envie os nomes separados por vírgula, ponto e vírgula ou linhas. A remoção aceita também um único nome."); return
+    if action=="toggle":
+        tag_id,anchor,page=int(p[2]),int(p[3]),int(p[4]); conn=get_db(); cur=conn.cursor()
+        cur.execute("SELECT nome FROM cartas WHERE id=%s",(anchor,)); row=cur.fetchone()
+        if not row:
+            cur.close(); conn.close(); await q.answer("Carta não encontrada.",show_alert=True); return
+        name=row[0]; cur.execute("SELECT id FROM cartas WHERE LOWER(nome)=LOWER(%s)",(name,)); ids=[r[0] for r in cur.fetchall()]
+        cur.execute("SELECT COUNT(*) FROM carta_tags WHERE carta_id=ANY(%s) AND tag_id=%s",(ids,tag_id)); exists=cur.fetchone()[0]>0
+        if exists:
+            cur.execute("DELETE FROM carta_tags WHERE carta_id=ANY(%s) AND tag_id=%s",(ids,tag_id)); note="Tag removida desse nome."
+        else:
+            changed=0; skipped=False
+            for cid in ids:
+                cur.execute("SELECT COUNT(*) FROM carta_tags WHERE carta_id=%s",(cid,)); count=cur.fetchone()[0]
+                if count>=3: skipped=True; continue
+                cur.execute("INSERT INTO carta_tags(carta_id,tag_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(cid,tag_id)); changed+=cur.rowcount
+            note=f"Tag aplicada a {changed} versão(ões)."+(" Algumas versões já atingiram o limite de 3 tags." if skipped else "")
+        conn.commit(); cur.close(); conn.close(); await q.answer(note,show_alert=True); await _tagadm_cards(q,tag_id,page,context.user_data.get(f"tagadm_search:{tag_id}"),answer_query=False); return
+
+async def _handler_texto_tagadm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending=context.user_data.get("tagadm_pending"); msg=update.effective_message
+    if not pending or not msg or not msg.text: return False
+    if not eh_editor(update.effective_user.id): context.user_data.pop("tagadm_pending",None); return True
+    action=pending["action"]; value=msg.text.strip()
+    if action=="create":
+        name=value.lstrip("#").strip()[:24]
+        if not name:
+            await msg.reply_text("Digite um nome de tag."); return True
+        conn=get_db(); cur=conn.cursor(); cur.execute("SELECT id FROM tags WHERE LOWER(nome)=LOWER(%s)",(name,)); row=cur.fetchone()
+        if row: tag_id=row[0]
+        else:
+            cur.execute("INSERT INTO tags(nome) VALUES(%s) RETURNING id",(name,)); tag_id=cur.fetchone()[0]
+        conn.commit(); cur.close(); conn.close(); context.user_data.pop("tagadm_pending",None)
+        await msg.reply_text(f"Tag <b>{esc(name)}</b> pronta. Agora você pode marcar nomes pelos botões ou colar uma lista.",parse_mode="HTML"); await _tagadm_cards(msg,tag_id,0); return True
+    if action=="search":
+        context.user_data.pop("tagadm_pending",None); context.user_data[f"tagadm_search:{pending['tag_id']}"]=value; await _tagadm_cards(msg,pending["tag_id"],0,value); return True
+    names=[part.strip().lstrip("#") for part in re.split(r"[,;\n{}]+",value) if part.strip()]
+    if action=="remove_name" and len(names)>1:
+        await msg.reply_text("Para remover por nome, envie um nome por vez; ou use Aplicar a lista para remover vários."); return True
+    changed,skipped,missing=_tagadm_apply_names(pending["tag_id"],names,remove=action=="remove_name")
+    context.user_data.pop("tagadm_pending",None)
+    summary=f"Alterações feitas em {changed} versão(ões)."
+    if skipped: summary+=f"\nLimite de 3 tags atingido: {', '.join(skipped[:12])}."
+    if missing: summary+=f"\nNão encontrei: {', '.join(missing[:20])}."
+    await msg.reply_text(summary)
+    await _tagadm_cards(msg,pending["tag_id"],0)
+    return True
 
 def _montar_wishlist(user_id: int, dono_id: int | None = None):
     conn = get_db()
@@ -2656,10 +2940,13 @@ def _montar_wishlist(user_id: int, dono_id: int | None = None):
     pessoa = cur.fetchone()
     cur.close()
     conn.close()
+    tags_by_id=_tags_por_carta([item[0] for item in itens])
     nome = pessoa[0] if pessoa and pessoa[0] else (f"@{pessoa[1]}" if pessoa and pessoa[1] else f"Mixer #{str(user_id)[-4:]}")
     linhas = [renderizar_template(obter_texto_publico("wishlist_titulo"), jogador=esc(nome)) + "\n"]
     if itens:
-        linhas.extend(f"• <code>#{cid}</code> {esc(carta_nome)} (T{tier})" for cid, carta_nome, tier in itens)
+        for cid,carta_nome,tier in itens:
+            tags_text=_texto_tags([cid],tags_by_id)
+            linhas.append(f"• <code>#{cid}</code> {esc(carta_nome)} (T{tier})"+(f" · {tags_text}" if tags_text else ""))
     else:
         linhas.append(obter_texto_publico("wishlist_vazia"))
     botoes = []
@@ -3245,6 +3532,8 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
         raise ApplicationHandlerStop
     if await _handler_texto_perfil(update, context):
         raise ApplicationHandlerStop
+    if await _handler_texto_tagadm(update, context):
+        raise ApplicationHandlerStop
     if context.user_data.get("evento_pendente"):
         manager = context.application.bot_data.get("eventos_manager")
         if manager and await manager.processar_texto(update, context):
@@ -3379,6 +3668,8 @@ async def _enviar_carta_por_id(target, user_id: int, carta_id: int, bot):
     codigo,local=formatar_local_carta(cid_cat,cat_nome,sid,sub_nome,ssid,subsub_nome)
     caption=(f"{obter_emoji_tier(tier)} <b>{cid}. {esc(nome)}</b> · Tier {tier}\n"
              f"💿 <b>{codigo}. {esc(local)}</b>\n♻️ Você possui: <b>{int(owned or 0)}</b>")
+    tags_text=_texto_tags([cid])
+    if tags_text: caption += "\n"+tags_text
     message=target.message if hasattr(target,"message") else target
     await enviar_midia_carta(message,file_id,media_type,caption,bot=bot)
 
@@ -4815,12 +5106,22 @@ async def ed_receber_id_texto(update: Update, context: ContextTypes.DEFAULT_TYPE
     if context.user_data.pop("ed_waiting_tags", False):
         d=context.user_data.get("ed_carta")
         if not d: return ED_MENU
-        values=[x.strip().lstrip("#")[:24] for x in update.message.text.split(",") if x.strip()]
+        values=[]
+        for item in update.message.text.split(","):
+            name=item.strip().lstrip("#")[:24]
+            if name and name.lower() not in {v.lower() for v in values}: values.append(name)
+        if len(values)>3:
+            context.user_data["ed_waiting_tags"]=True
+            await update.message.reply_text("Cada carta pode ter até 3 tags. Envie no máximo três, separadas por vírgula:")
+            return ED_MENU
         conn=get_db(); cur=conn.cursor()
         cur.execute("DELETE FROM carta_tags WHERE carta_id=%s",(d["id"],))
         for value in values:
-            cur.execute("INSERT INTO tags(nome) VALUES(%s) ON CONFLICT(nome) DO UPDATE SET nome=EXCLUDED.nome RETURNING id",(value,))
-            tid=cur.fetchone()[0]; cur.execute("INSERT INTO carta_tags(carta_id,tag_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(d["id"],tid))
+            cur.execute("SELECT id FROM tags WHERE LOWER(nome)=LOWER(%s)",(value,)); row=cur.fetchone()
+            if row: tid=row[0]
+            else:
+                cur.execute("INSERT INTO tags(nome) VALUES(%s) RETURNING id",(value,)); tid=cur.fetchone()[0]
+            cur.execute("INSERT INTO carta_tags(carta_id,tag_id) VALUES(%s,%s) ON CONFLICT DO NOTHING",(d["id"],tid))
         conn.commit(); cur.close(); conn.close()
         texto,markup=_montar_menu_edicao(d)
         await update.message.reply_text("Tags atualizadas.\n\n"+texto,reply_markup=markup,parse_mode="HTML")
@@ -4863,7 +5164,7 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Escolha uma carta primeiro.",show_alert=True); return ED_MENU
         conn=get_db(); cur=conn.cursor(); cur.execute("SELECT t.nome FROM tags t JOIN carta_tags ct ON ct.tag_id=t.id WHERE ct.carta_id=%s ORDER BY t.nome",(d["id"],)); current=", ".join(x[0] for x in cur.fetchall()); cur.close(); conn.close()
         context.user_data["ed_waiting_tags"]=True
-        await query.answer(); await query.edit_message_text(f"Tags atuais: {esc(current) if current else 'nenhuma'}\nEnvie tags separadas por vírgula (até 24 caracteres cada). Envie uma mensagem vazia para remover todas:")
+        await query.answer(); await query.edit_message_text(f"Tags atuais: {esc(current) if current else 'nenhuma'}\nEnvie até 3 tags separadas por vírgula (até 24 caracteres cada). Envie uma mensagem vazia para remover todas:")
         return ED_MENU
 
     if query.data == "studio_menu":
@@ -6414,7 +6715,7 @@ async def bloqueio_nao_admin(update: Update) -> bool:
 
 def _studio_teclado(page: int, user_id: int) -> InlineKeyboardMarkup:
     if not eh_admin(user_id):
-        return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],[InlineKeyboardButton("🏷️ Gerenciar tags",callback_data="studio_ui|tags")]])
     page = max(0, min(2, page))
     botoes = []
     if page == 0:
@@ -6434,6 +6735,8 @@ def _studio_teclado(page: int, user_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🚫 Banimentos", callback_data="studio_ui|ban")],
             [InlineKeyboardButton("🎲 Dar giros", callback_data="studio_ui|help_dargiros"), InlineKeyboardButton("🧹 Zerar inventários", callback_data="studio_ui|help_deleteall")],
         ]
+    if page == 1:
+        botoes.append([InlineKeyboardButton("🏷️ Gerenciar tags",callback_data="studio_ui|tags")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️", callback_data=f"studio_ui|page|{page-1}"))
@@ -6449,7 +6752,7 @@ async def _mostrar_studio(target, user_id: int, page: int = 0):
     if not editor_only:
         texto += "🎲 <b>Giros:</b> 10 giros diários; reposição à meia-noite (horário de São Paulo). Os giros acumulam.\n\nEscolha uma seção:"
     else:
-        texto += "Edite os textos públicos e as mensagens do painel administrativo."
+        texto += "Edite os textos públicos e gerencie tags de artistas/personagens em lote."
     await target.reply_text(texto, reply_markup=_studio_teclado(page, user_id), parse_mode="HTML")
 
 async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6457,7 +6760,7 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not eh_editor(q.from_user.id):
         await q.answer("Apenas equipe autorizada.", show_alert=True); return
     p = q.data.split("|"); action = p[1]
-    if action not in ("noop", "page") and not eh_admin(q.from_user.id):
+    if action not in ("noop", "page", "tags") and not eh_admin(q.from_user.id):
         await q.answer("Apenas administradores.", show_alert=True); return
     if action == "noop":
         await q.answer(); return
@@ -6476,6 +6779,8 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         rows=[[InlineKeyboardButton(f"{'✅' if t in active else '➕'} {TIERS_CONFIG[t]['nome']}",callback_data=f"studio_ui|molduratri|{t}")] for t in range(1,7)]
         rows.append([InlineKeyboardButton("⬅️ Studio",callback_data="studio_ui|page|1")])
         await q.answer(); await q.edit_message_text("🖼️ <b>Molduras por tier</b>\nEscolha um tier para enviar/substituir a moldura. O arquivo precisa ser PNG.",reply_markup=InlineKeyboardMarkup(rows),parse_mode="HTML"); return
+    if action == "tags":
+        await q.answer(); await _tagadm_home(q,0); return
     if action == "molduratri":
         tier=int(p[2]); conn=get_db(); cur=conn.cursor(); cur.execute("SELECT 1 FROM molduras WHERE tier=%s",(tier,)); active=cur.fetchone() is not None; cur.close(); conn.close()
         buttons=[[InlineKeyboardButton("📤 Enviar/substituir PNG",callback_data=f"studio_ui|moldurafile|{tier}")]]
@@ -7493,6 +7798,7 @@ async def main():
         "resolver_jogador": _resolver_jogador, "verificar_usuario": verificar_usuario,
         "executar_sorteio": executar_sorteio,
         "tier_nome": lambda tier: TIERS_CONFIG[tier]["nome"],
+        "tags_por_carta": _tags_por_carta,
         "retirar_inventario": _retirar_inventario, "adicionar_inventario": _adicionar_inventario,
         "regenerar_moldura_evento": _regenerar_cartas_moldura_evento,
     })
@@ -7645,6 +7951,9 @@ async def main():
     app.add_handler(CommandHandler("apelido", cmd_apelido))
     app.add_handler(CommandHandler("perfil", cmd_perfil))
     app.add_handler(CallbackQueryHandler(callback_perfil, pattern=r"^perfil\|"))
+    app.add_handler(CommandHandler("casar", cmd_casar))
+    app.add_handler(CommandHandler("divorciar", cmd_divorciar))
+    app.add_handler(CallbackQueryHandler(callback_casamento, pattern=r"^casar\|"))
     app.add_handler(CommandHandler("meuid", cmd_meu_id))
     app.add_handler(CommandHandler("girar", cmd_girar))
     app.add_handler(CommandHandler(["catalogo", "cartas"], cmd_catalogo))
@@ -7653,6 +7962,8 @@ async def main():
     app.add_handler(CommandHandler(["colecao", "col"], cmd_colecao))
     app.add_handler(CallbackQueryHandler(callback_colecao, pattern=r"^colecao\|"))
     app.add_handler(CommandHandler("tag", cmd_tag))
+    app.add_handler(CommandHandler("tags", cmd_tags_admin))
+    app.add_handler(CallbackQueryHandler(callback_tagadm, pattern=r"^tagadm\|"))
     app.add_handler(CallbackQueryHandler(callback_tag, pattern=r"^tag\|"))
     app.add_handler(CallbackQueryHandler(callback_col_tag, pattern=r"^col\|"))
     app.add_handler(CommandHandler("carta", cmd_carta))
@@ -7740,6 +8051,8 @@ async def main():
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
         BotCommand("apelido", "Definir seu apelido único no jogo"),
         BotCommand("perfil", "Ver e editar seu perfil"),
+        BotCommand("casar", "Propor casamento a outro jogador"),
+        BotCommand("divorciar", "Encerrar seu casamento"),
         BotCommand("comandos", "Ver todos os comandos disponíveis"),
         BotCommand("colecao", "Ver toda a sua coleção"),
         BotCommand("catalogo", "Listar cartas por categoria"),
@@ -7762,3 +8075,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
