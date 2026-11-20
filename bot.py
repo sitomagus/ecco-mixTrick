@@ -1395,10 +1395,10 @@ async def _renderizar_perfil(user_id: int):
     nivel = int(xp or 0) // 100 + 1
     progresso = int(xp or 0) % 100
     nome_parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else None
-    # Coelhinhos em ASCII com barras invertidas costumam perder/embaralhar as
-    # orelhas no renderizador do Telegram. Estes glifos mantêm o desenho estável.
+    # O bloco <pre> preserva espaços e barras do desenho ASCII no Telegram.
     parceiro = (
-        f"🫧 ꒰ᐢ. .ᐢ꒱ 💍 ꒰ᐢ. .ᐢ꒱\nMeu coração pertence a <b>{esc(nome_parceiro)}</b>"
+        f"<pre>  /)/)   (\\(\\\n {  . .}  {. .  }\no/💍  ^^ \\</pre>\n"
+        f"<blockquote>Meu coração pertence a <b>{esc(nome_parceiro)}</b></blockquote>"
         if nome_parceiro else "🫧 Solteiro(a)"
     )
     carta = f"{carta_nome} [Tier {carta_tier}]" if carta_nome else "Não definida"
