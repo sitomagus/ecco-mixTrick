@@ -75,16 +75,27 @@ TEXTOS_PADRAO = {
     ),
     "comandos_texto": (
         "📜 <b>Comandos do Ecco-Mix Trick</b>\n\n"
-        "• /colecao — Ver toda a sua coleção agrupada\n"
-        "• /catalogo — Ver todas as cartas cadastradas por categoria\n"
+        "• /start ou /ajuda — Abrir o bot e ver as informações iniciais\n"
+        "• /comandos ou /comados — Ver esta lista de comandos\n"
+        "• /apelido <code>nome</code> — Definir seu nome de exibição no jogo\n"
+        "• /perfil [pessoa] — Ver seu perfil ou o perfil de outra pessoa\n"
+        "• /casar <code>@pessoa</code> ou apelido — Fazer uma proposta de casamento\n"
+        "• /divorciar — Encerrar seu casamento\n"
+        "• /meuid — Ver seu ID numérico do Telegram\n"
+        "• /girar — Escolher uma categoria e sortear uma carta; use <code>/girar tudo</code> para mix múltiplo\n"
+        "• /catalogo ou /cartas — Ver as cartas cadastradas\n"
+        "• /colecao ou /col [tag] — Ver sua coleção, opcionalmente filtrada por tag\n"
         "• /artista <code>nome</code> — Ver seu progresso nos tiers de um artista/personagem\n"
-        "• /ranking <code>nome</code> — Ver ranking de jogadores de um artista/personagem\n"
-        "• /carta <code>ID</code> — Visualizar a imagem/GIF de uma carta\n"
-        "• /trocar <code>@pessoa</code> ou apelido — Propor troca e escolher cartas pelos botões\n"
-        "• /doar <code>@pessoa</code> ou apelido — Doar cartas pelo menu de botões\n"
-        "• /wishlist [@pessoa ou apelido] — Ver e editar sua wishlist ou consultar a de alguém\n"
+        "• /ranking ou /top [nome] — Ver o ranking de jogadores por artista/personagem\n"
+        "• /tag <code>nome</code> — Abrir Minha coleção ou Catálogo de uma tag\n"
+        "• /carta <code>ID ou nome</code> — Ver uma carta e suas cópias no inventário\n"
+        "• /trocar <code>@pessoa</code> ou apelido — Propor uma troca\n"
+        "• /doar <code>@pessoa</code> ou apelido — Doar cartas usando os botões\n"
+        "• /wishlist [pessoa] — Editar sua lista de desejos ou consultar a de alguém\n"
         "• /loja — Vender cartas por EccoCoins e comprar giros\n"
-        "• /meuid — Ver seu ID numérico do Telegram"
+        "• /eventos — Abrir eventos ativos\n"
+        "• /natalpresente <code>@pessoa</code> — Presentear carta(s) do evento de Natal\n"
+        "• /pular — Pular a dedicatória opcional durante um presente de evento"
     ),
     "menu_girar": (
         "🫧 <b>{apelido}</b> • 🍃 Giros restantes: <b>{giros}</b>\n"
@@ -142,6 +153,37 @@ TEXTOS_PADRAO = {
     "wishlist_busca": "Digite o nome de uma carta ou artista para buscar na wishlist:",
     "wishlist_sem_resultados": "Não encontrei cartas com <b>{busca}</b>.",
     "wishlist_resultados": "🔍 Resultados para <b>{busca}</b>:",
+    "perfil_texto": (
+        "⠀⢏⢢⣀⡔⡹  ⊹   <b>{display}</b>\n"
+        "💧 : {bio}\n♻️ : {cartas} cartas no inventário\n"
+        "🖥 : Nível {nivel} · {xp} XP ({progresso}/100 para o próximo nível)\n"
+        "🌱 : {musica}\n🫧 : {parceiro}\n\n🖱 : {carta}{tags}"
+    ),
+    "casamento_proposta": "💌 <b>Proposta de casamento</b>\n{remetente} quer se casar com você.",
+    "casamento_enviada": "💌 Proposta enviada no privado. A pessoa pode aceitar ou recusar por lá.",
+    "casamento_fallback": "💌 Não consegui enviar no privado; deixei a proposta aqui no chat.",
+    "casamento_uso": "Use <code>/casar @pessoa</code> ou responda à mensagem dela com <code>/casar</code>.",
+    "casamento_nao_encontrada": "Não encontrei essa pessoa. Ela precisa iniciar o bot com /start.",
+    "casamento_inativo": "Essa pessoa precisa iniciar o bot antes de receber propostas.",
+    "casamento_auto": "Você não pode propor casamento a si mesmo.",
+    "casamento_indisponivel": "Uma das pessoas já está em um casamento. Para encerrar, use /divorciar.",
+    "casamento_pendente": "Você já enviou uma proposta que ainda está aguardando resposta.",
+    "casamento_recusado": "🙅 A proposta de casamento foi recusada.",
+    "casamento_aceito": "💍 <b>Casamento confirmado!</b> Parabéns ao novo casal!",
+    "casamento_cancelado": "Essa proposta foi cancelada porque uma das pessoas já está casada.",
+    "casamento_divorciado": "💔 O casamento foi encerrado.",
+    "casamento_sem_ativo": "Seu perfil não mostra um casamento ativo.",
+    "casamento_botao_aceitar": "💍 Aceitar",
+    "casamento_botao_recusar": "🙅 Recusar",
+    "casamento_alert_inexistente": "Proposta não encontrada.",
+    "casamento_alert_nao_destinatario": "Só o destinatário pode responder a esta proposta.",
+    "casamento_alert_respondida": "Essa proposta já foi respondida.",
+    "casamento_alert_recusada": "Proposta recusada.",
+    "casamento_alert_conflito": "Uma das pessoas já se casou; proposta cancelada.",
+    "casamento_alert_aceito": "Vocês agora estão casados! 💍",
+    "studio_inicio_admin": "🎛️ <b>Ecco-Mix Studio</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam.\n\nEscolha uma seção:",
+    "studio_inicio_editor": "📝 <b>Editor do Studio</b>\n\nEdite os textos públicos e gerencie tags de artistas/personagens em lote.",
+    "studio_pagina": "🎛️ <b>Ecco-Mix Studio · Página {pagina}/3</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam.",
 }
 
 TEXTOS_META = {
@@ -202,6 +244,32 @@ TEXTOS_META = {
     "wishlist_busca": {"titulo": "🔍 Buscar cartas na Wishlist", "vars": "(sem variáveis)"},
     "wishlist_sem_resultados": {"titulo": "🔍 Busca sem resultados", "vars": "{busca}"},
     "wishlist_resultados": {"titulo": "🔍 Resultados da Wishlist", "vars": "{busca}"},
+    "perfil_texto": {"titulo": "👤 Mensagem do /perfil", "vars": "{display}, {bio}, {cartas}, {nivel}, {xp}, {progresso}, {musica}, {parceiro}, {carta}, {tags}"},
+    "casamento_proposta": {"titulo": "💌 /casar · Proposta enviada ao destinatário", "vars": "{remetente}", "media": True},
+    "casamento_enviada": {"titulo": "💌 /casar · Confirmação ao remetente", "vars": "(sem variáveis)"},
+    "casamento_fallback": {"titulo": "💌 /casar · Aviso de envio no chat", "vars": "(sem variáveis)"},
+    "casamento_uso": {"titulo": "💌 /casar · Instrução de uso", "vars": "(sem variáveis)"},
+    "casamento_nao_encontrada": {"titulo": "💌 /casar · Pessoa não encontrada", "vars": "(sem variáveis)"},
+    "casamento_inativo": {"titulo": "💌 /casar · Pessoa precisa iniciar o bot", "vars": "(sem variáveis)"},
+    "casamento_auto": {"titulo": "💌 /casar · Não permitir proposta para si", "vars": "(sem variáveis)"},
+    "casamento_indisponivel": {"titulo": "💌 /casar · Uma pessoa já está casada", "vars": "(sem variáveis)"},
+    "casamento_pendente": {"titulo": "💌 /casar · Proposta já pendente", "vars": "(sem variáveis)"},
+    "casamento_recusado": {"titulo": "💔 /casar · Proposta recusada", "vars": "(sem variáveis)", "media": True},
+    "casamento_aceito": {"titulo": "💍 /casar · Casamento confirmado", "vars": "(sem variáveis)", "media": True},
+    "casamento_cancelado": {"titulo": "💍 /casar · Proposta cancelada", "vars": "(sem variáveis)"},
+    "casamento_divorciado": {"titulo": "💔 /divorciar · Casamento encerrado", "vars": "(sem variáveis)", "media": True},
+    "casamento_sem_ativo": {"titulo": "💔 /divorciar · Sem casamento ativo", "vars": "(sem variáveis)"},
+    "casamento_botao_aceitar": {"titulo": "💌 /casar · Botão de aceitar", "vars": "(sem variáveis)"},
+    "casamento_botao_recusar": {"titulo": "💌 /casar · Botão de recusar", "vars": "(sem variáveis)"},
+    "casamento_alert_inexistente": {"titulo": "💌 /casar · Alerta de proposta não encontrada", "vars": "(sem variáveis)"},
+    "casamento_alert_nao_destinatario": {"titulo": "💌 /casar · Alerta para outra pessoa", "vars": "(sem variáveis)"},
+    "casamento_alert_respondida": {"titulo": "💌 /casar · Alerta de resposta duplicada", "vars": "(sem variáveis)"},
+    "casamento_alert_recusada": {"titulo": "💌 /casar · Aviso de recusa", "vars": "(sem variáveis)"},
+    "casamento_alert_conflito": {"titulo": "💌 /casar · Aviso de conflito", "vars": "(sem variáveis)"},
+    "casamento_alert_aceito": {"titulo": "💌 /casar · Aviso de aceitação", "vars": "(sem variáveis)"},
+    "studio_inicio_admin": {"titulo": "🎛️ Studio · Mensagem inicial do admin", "vars": "(sem variáveis)"},
+    "studio_inicio_editor": {"titulo": "📝 Studio · Mensagem inicial do editor", "vars": "(sem variáveis)"},
+    "studio_pagina": {"titulo": "🎛️ Studio · Cabeçalho e regras das páginas", "vars": "{pagina}"},
 }
 
 CATALOGO_INICIAL = {
@@ -1061,27 +1129,70 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     verificar_usuario(user.id, user.username)
     texto = obter_texto_publico("comandos_texto")
-    comandos_novos = [
-        ("/tag", "• /tag nome — Ver Minha coleção e Catálogo filtrados por tag"),
-        ("/col", "• /col tag — Ver sua coleção filtrada por tag"),
-        ("/casar", "• /casar @pessoa — Propor casamento para outro jogador"),
-        ("/divorciar", "• /divorciar — Encerrar seu casamento atual"),
-        ("/perfil", "• /perfil [@pessoa] — Ver e editar seu perfil, XP e carta favorita"),
-        ("/carta", "• /carta ID ou nome — Ver uma carta e consultar quantas cópias você possui"),
-        ("/eventos", "• /eventos — Abrir eventos ativos e suas cartas especiais"),
-        ("/natalpresente", "• /natalpresente @pessoa — Presentear cartas do evento de Natal"),
-        ("/trocar", "• /trocar <code>@pessoa</code> ou apelido — Propor troca escolhendo cartas pelos botões"),
-        ("/doar", "• /doar <code>@pessoa</code> ou apelido — Doar cartas com botões"),
-        ("/wishlist", "• /wishlist [pessoa] — Editar sua wishlist ou consultar a de alguém"),
+    obrigatorios = [
+        ("/start", "• /start ou /ajuda — Abrir o bot e ver as informações iniciais"),
+        ("/comandos", "• /comandos ou /comados — Ver esta lista de comandos"),
+        ("/apelido", "• /apelido <code>nome</code> — Definir seu nome de exibição no jogo"),
+        ("/perfil", "• /perfil [pessoa] — Ver seu perfil ou o perfil de outra pessoa"),
+        ("/casar", "• /casar <code>@pessoa</code> ou apelido — Fazer uma proposta de casamento"),
+        ("/divorciar", "• /divorciar — Encerrar seu casamento"),
+        ("/meuid", "• /meuid — Ver seu ID numérico do Telegram"),
+        ("/girar", "• /girar — Escolher uma categoria e sortear uma carta; use <code>/girar tudo</code> para mix múltiplo"),
+        ("/catalogo", "• /catalogo ou /cartas — Ver as cartas cadastradas"),
+        ("/colecao", "• /colecao ou /col [tag] — Ver sua coleção, opcionalmente filtrada por tag"),
+        ("/artista", "• /artista <code>nome</code> — Ver seu progresso nos tiers de um artista/personagem"),
+        ("/ranking", "• /ranking ou /top [nome] — Ver o ranking de jogadores por artista/personagem"),
+        ("/tag", "• /tag <code>nome</code> — Abrir Minha coleção ou Catálogo de uma tag"),
+        ("/carta", "• /carta <code>ID ou nome</code> — Ver uma carta e suas cópias no inventário"),
+        ("/trocar", "• /trocar <code>@pessoa</code> ou apelido — Propor uma troca"),
+        ("/doar", "• /doar <code>@pessoa</code> ou apelido — Doar cartas usando os botões"),
+        ("/wishlist", "• /wishlist [pessoa] — Editar sua lista de desejos ou consultar a de alguém"),
         ("/loja", "• /loja — Vender cartas por EccoCoins e comprar giros"),
+        ("/eventos", "• /eventos — Abrir eventos ativos"),
+        ("/natalpresente", "• /natalpresente <code>@pessoa</code> — Presentear cartas do evento de Natal"),
+        ("/pular", "• /pular — Pular a dedicatória opcional durante um presente de evento"),
     ]
-    linhas_ausentes = [
-        linha for comando, linha in comandos_novos
-        if (comando not in texto or (comando == "/trocar" and "@pessoa" not in texto) or (comando == "/carta" and "ou nome" not in texto) or (comando == "/col" and "/col tag" not in texto) or (comando == "/tag" and "/tag nome" not in texto))
+    body = texto.splitlines()
+    title = body[0] if body else "📜 <b>Comandos do Ecco-Mix Trick</b>"
+    body = [line for line in body[1:] if line.strip()]
+    known = "\n".join(body)
+    for command, line in obrigatorios:
+        if not re.search(r"(?<![\w/])" + re.escape(command) + r"(?!\w)", known, re.IGNORECASE):
+            body.append(line)
+    per_page = 7
+    pages = max(1, (len(body) + per_page - 1) // per_page)
+    page = max(0, min(int(context.args[0]) - 1, pages - 1)) if context.args and context.args[0].isdigit() else 0
+    markup = None
+    if pages > 1:
+        buttons=[]; nav=[]
+        if page: nav.append(InlineKeyboardButton("⬅️ Anterior",callback_data=f"comandos|{page-1}"))
+        nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="comandos|noop"))
+        if page+1<pages: nav.append(InlineKeyboardButton("Próxima ➡️",callback_data=f"comandos|{page+1}"))
+        buttons.append(nav); markup=InlineKeyboardMarkup(buttons)
+    page_text = "\n".join(body[page*per_page:(page+1)*per_page])
+    await msg.reply_text(f"{title}\n\n{page_text}", parse_mode="HTML", reply_markup=markup)
+
+async def callback_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if not q: return
+    await q.answer()
+    if q.data.endswith("|noop"): return
+    page=int(q.data.split("|")[1])
+    texto=obter_texto_publico("comandos_texto")
+    # Reuse the same normalization and pagination by rebuilding from the canonical list.
+    required=[
+        ("/start","• /start ou /ajuda — Abrir o bot e ver as informações iniciais"),("/comandos","• /comandos ou /comados — Ver esta lista de comandos"),("/apelido","• /apelido <code>nome</code> — Definir seu nome de exibição no jogo"),("/perfil","• /perfil [pessoa] — Ver seu perfil ou o perfil de outra pessoa"),("/casar","• /casar <code>@pessoa</code> ou apelido — Fazer uma proposta de casamento"),("/divorciar","• /divorciar — Encerrar seu casamento"),("/meuid","• /meuid — Ver seu ID numérico do Telegram"),("/girar","• /girar — Escolher uma categoria e sortear uma carta; use <code>/girar tudo</code> para mix múltiplo"),("/catalogo","• /catalogo ou /cartas — Ver as cartas cadastradas"),("/colecao","• /colecao ou /col [tag] — Ver sua coleção, opcionalmente filtrada por tag"),("/artista","• /artista <code>nome</code> — Ver seu progresso nos tiers de um artista/personagem"),("/ranking","• /ranking ou /top [nome] — Ver o ranking de jogadores por artista/personagem"),("/tag","• /tag <code>nome</code> — Abrir Minha coleção ou Catálogo de uma tag"),("/carta","• /carta <code>ID ou nome</code> — Ver uma carta e suas cópias no inventário"),("/trocar","• /trocar <code>@pessoa</code> ou apelido — Propor uma troca"),("/doar","• /doar <code>@pessoa</code> ou apelido — Doar cartas usando os botões"),("/wishlist","• /wishlist [pessoa] — Editar sua lista de desejos ou consultar a de alguém"),("/loja","• /loja — Vender cartas por EccoCoins e comprar giros"),("/eventos","• /eventos — Abrir eventos ativos"),("/natalpresente","• /natalpresente <code>@pessoa</code> — Presentear cartas do evento de Natal"),("/pular","• /pular — Pular a dedicatória opcional durante um presente de evento"),
     ]
-    if linhas_ausentes:
-        texto = f"{texto.rstrip()}\n" + "\n".join(linhas_ausentes)
-    await msg.reply_text(texto, parse_mode="HTML")
+    lines=texto.splitlines(); title=lines[0] if lines else "📜 <b>Comandos do Ecco-Mix Trick</b>"; body=[line for line in lines[1:] if line.strip()]; known="\n".join(body)
+    for command,line in required:
+        if not re.search(r"(?<![\w/])"+re.escape(command)+r"(?!\w)",known,re.IGNORECASE): body.append(line)
+    size=7; pages=max(1,(len(body)+size-1)//size); page=max(0,min(page,pages-1)); nav=[]; buttons=[]
+    if page: nav.append(InlineKeyboardButton("⬅️ Anterior",callback_data=f"comandos|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="comandos|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("Próxima ➡️",callback_data=f"comandos|{page+1}"))
+    buttons.append(nav)
+    content=f"{title}\n\n"+"\n".join(body[page*size:(page+1)*size])
+    await q.edit_message_text(content,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(buttons))
 
 async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1152,33 +1263,54 @@ async def _buscar_usuario_perfil(identificador: str):
     row = cur.fetchone(); cur.close(); conn.close()
     return row[0] if row else None
 
+async def _enviar_texto_publico(bot, chat_id: int, chave: str, texto: str, reply_markup=None):
+    media_id=obter_config_valor(f"texto_midia_{chave}_id","")
+    media_type=obter_config_valor(f"texto_midia_{chave}_type","animation")
+    caption_kwargs={"caption":texto,"parse_mode":"HTML"} if len(texto)<=1024 else {}
+    if media_id and media_type=="photo":
+        await bot.send_photo(chat_id=chat_id,photo=media_id,reply_markup=reply_markup,**caption_kwargs)
+    elif media_id:
+        await bot.send_animation(chat_id=chat_id,animation=media_id,reply_markup=reply_markup,**caption_kwargs)
+    else:
+        await bot.send_message(chat_id=chat_id,text=texto,reply_markup=reply_markup,parse_mode="HTML")
+        return
+    if not caption_kwargs:
+        await bot.send_message(chat_id=chat_id,text=texto,parse_mode="HTML")
+
+async def _editar_resposta_casamento(query, texto: str):
+    msg=query.message
+    if msg and (msg.animation or msg.photo):
+        await query.edit_message_caption(caption=texto,parse_mode="HTML")
+    else:
+        await query.edit_message_text(texto,parse_mode="HTML")
+
 async def _propor_casamento(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id: int):
     proposer=update.effective_user; msg=update.effective_message
     if not proposer or not msg: return
     if target_id==proposer.id:
-        await msg.reply_text("Você não pode propor casamento a si mesmo."); return
+        await msg.reply_text(obter_texto_publico("casamento_auto"),parse_mode="HTML"); return
     verificar_usuario(proposer.id,proposer.username)
     conn=get_db(); cur=conn.cursor()
     cur.execute("SELECT user_id,casado_com FROM usuarios WHERE user_id=ANY(%s) ORDER BY user_id",([proposer.id,target_id],)); rows=cur.fetchall()
     married={uid:partner for uid,partner in rows}
     if target_id not in married:
-        cur.close(); conn.close(); await msg.reply_text("Essa pessoa precisa iniciar o bot antes de receber propostas."); return
+        cur.close(); conn.close(); await msg.reply_text(obter_texto_publico("casamento_inativo"),parse_mode="HTML"); return
     if married.get(proposer.id) or married.get(target_id):
-        cur.close(); conn.close(); await msg.reply_text("Uma das pessoas já está em um casamento. Para encerrar, use /divorciar."); return
+        cur.close(); conn.close(); await msg.reply_text(obter_texto_publico("casamento_indisponivel"),parse_mode="HTML"); return
     cur.execute("SELECT id FROM pedidos_casamento WHERE proponente_id=%s AND destinatario_id=%s AND status='pendente'",(proposer.id,target_id)); pending=cur.fetchone()
     if pending:
-        cur.close(); conn.close(); await msg.reply_text("Você já enviou uma proposta que ainda está aguardando resposta."); return
+        cur.close(); conn.close(); await msg.reply_text(obter_texto_publico("casamento_pendente"),parse_mode="HTML"); return
     cur.execute("INSERT INTO pedidos_casamento(proponente_id,destinatario_id,chat_id) VALUES(%s,%s,%s) RETURNING id",(proposer.id,target_id,msg.chat_id)); proposal_id=cur.fetchone()[0]
     cur.execute("SELECT apelido,username FROM usuarios WHERE user_id=%s",(proposer.id,)); who=cur.fetchone(); conn.commit(); cur.close(); conn.close()
     sender=(who[0] or (f"@{who[1]}" if who and who[1] else f"Mixer #{str(proposer.id)[-4:]}")) if who else "Alguém"
-    keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("💍 Aceitar",callback_data=f"casar|aceitar|{proposal_id}"),InlineKeyboardButton("🙅 Recusar",callback_data=f"casar|recusar|{proposal_id}")]])
-    text=f"💌 <b>Proposta de casamento</b>\n{esc(sender)} quer se casar com você."
+    keyboard=InlineKeyboardMarkup([[InlineKeyboardButton(obter_texto_publico("casamento_botao_aceitar"),callback_data=f"casar|aceitar|{proposal_id}"),InlineKeyboardButton(obter_texto_publico("casamento_botao_recusar"),callback_data=f"casar|recusar|{proposal_id}")]])
+    text=renderizar_template(obter_texto_publico("casamento_proposta"),remetente=esc(sender))
     try:
-        await context.bot.send_message(chat_id=target_id,text=text,reply_markup=keyboard,parse_mode="HTML")
-        await msg.reply_text("💌 Proposta enviada no privado. A pessoa pode aceitar ou recusar por lá.")
+        await _enviar_texto_publico(context.bot,target_id,"casamento_proposta",text,keyboard)
+        await msg.reply_text(obter_texto_publico("casamento_enviada"),parse_mode="HTML")
     except Exception:
-        await context.bot.send_message(chat_id=msg.chat_id,text=text,reply_markup=keyboard,parse_mode="HTML")
-        await msg.reply_text("💌 Não consegui enviar no privado; deixei a proposta aqui no chat.")
+        await _enviar_texto_publico(context.bot,msg.chat_id,"casamento_proposta",text,keyboard)
+        await msg.reply_text(obter_texto_publico("casamento_fallback"),parse_mode="HTML")
 
 async def cmd_casar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg=update.effective_message; user=update.effective_user
@@ -1187,45 +1319,47 @@ async def cmd_casar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not alvo and msg.reply_to_message and msg.reply_to_message.from_user:
         alvo=str(msg.reply_to_message.from_user.id)
     if not alvo:
-        await msg.reply_text("Use <code>/casar @pessoa</code> ou responda à mensagem dela com <code>/casar</code>.",parse_mode="HTML"); return
+        await msg.reply_text(obter_texto_publico("casamento_uso"),parse_mode="HTML"); return
     target_id=await _buscar_usuario_perfil(alvo)
     if not target_id:
-        await msg.reply_text("Não encontrei essa pessoa. Ela precisa iniciar o bot com /start."); return
+        await msg.reply_text(obter_texto_publico("casamento_nao_encontrada"),parse_mode="HTML"); return
     await _propor_casamento(update,context,target_id)
 
 async def callback_casamento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; _,action,proposal_raw=q.data.split("|"); proposal_id=int(proposal_raw)
     conn=get_db(); cur=conn.cursor(); cur.execute("SELECT proponente_id,destinatario_id,chat_id,status FROM pedidos_casamento WHERE id=%s FOR UPDATE",(proposal_id,)); proposal=cur.fetchone()
     if not proposal:
-        conn.rollback(); cur.close(); conn.close(); await q.answer("Proposta não encontrada.",show_alert=True); return
+        conn.rollback(); cur.close(); conn.close(); await q.answer(obter_texto_publico("casamento_alert_inexistente"),show_alert=True); return
     proposer,target,origin_chat,status=proposal
     if q.from_user.id!=target:
-        conn.rollback(); cur.close(); conn.close(); await q.answer("Só o destinatário pode responder a esta proposta.",show_alert=True); return
+        conn.rollback(); cur.close(); conn.close(); await q.answer(obter_texto_publico("casamento_alert_nao_destinatario"),show_alert=True); return
     if status!="pendente":
-        conn.rollback(); cur.close(); conn.close(); await q.answer("Essa proposta já foi respondida.",show_alert=True); return
+        conn.rollback(); cur.close(); conn.close(); await q.answer(obter_texto_publico("casamento_alert_respondida"),show_alert=True); return
     if action=="recusar":
         cur.execute("UPDATE pedidos_casamento SET status='recusado' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
-        await q.answer("Proposta recusada."); await q.edit_message_text("🙅 Você recusou a proposta de casamento.")
-        texto="🙅 A proposta de casamento foi recusada."
+        await q.answer(obter_texto_publico("casamento_alert_recusada")); await _editar_resposta_casamento(q,obter_texto_publico("casamento_recusado"))
+        texto=obter_texto_publico("casamento_recusado")
+        chave_texto="casamento_recusado"
     else:
         cur.execute("SELECT user_id,casado_com FROM usuarios WHERE user_id=ANY(%s) ORDER BY user_id FOR UPDATE",([proposer,target],)); users=cur.fetchall(); pairs={uid:partner for uid,partner in users}
         if len(users)<2 or pairs.get(proposer) or pairs.get(target):
             cur.execute("UPDATE pedidos_casamento SET status='cancelado' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
-            await q.answer("Uma das pessoas já se casou; proposta cancelada.",show_alert=True); await q.edit_message_text("Essa proposta foi cancelada porque uma das pessoas já está casada."); return
+            await q.answer(obter_texto_publico("casamento_alert_conflito"),show_alert=True); await _editar_resposta_casamento(q,obter_texto_publico("casamento_cancelado")); return
         a,b=sorted((proposer,target))
         cur.execute("UPDATE usuarios SET casado_com=CASE WHEN user_id=%s THEN %s ELSE %s END WHERE user_id=ANY(%s)",(proposer,target,proposer,[proposer,target]))
         cur.execute("INSERT INTO casamentos(usuario_a,usuario_b,chat_id) VALUES(%s,%s,%s)",(a,b,origin_chat))
         cur.execute("UPDATE pedidos_casamento SET status='aceito' WHERE id=%s",(proposal_id,)); conn.commit(); cur.close(); conn.close()
-        await q.answer("Vocês agora estão casados! 💍"); await q.edit_message_text("💍 Proposta aceita! Vocês agora estão casados.")
-        texto="💍 <b>Casamento confirmado!</b> Parabéns ao novo casal!"
-    await _notificar_casamento(context.bot,proposer,target,origin_chat,texto)
+        await q.answer(obter_texto_publico("casamento_alert_aceito")); await _editar_resposta_casamento(q,obter_texto_publico("casamento_aceito"))
+        texto=obter_texto_publico("casamento_aceito")
+        chave_texto="casamento_aceito"
+    await _notificar_casamento(context.bot,proposer,target,origin_chat,texto,chave_texto)
 
-async def _notificar_casamento(bot, user_a: int, user_b: int, chat_id: int | None, texto: str):
+async def _notificar_casamento(bot, user_a: int, user_b: int, chat_id: int | None, texto: str, chave_texto: str = "casamento_divorciado"):
     for uid in {user_a,user_b}:
-        try: await bot.send_message(chat_id=uid,text=texto,parse_mode="HTML")
+        try: await _enviar_texto_publico(bot,uid,chave_texto,texto)
         except Exception: pass
     if chat_id and chat_id not in {user_a,user_b}:
-        try: await bot.send_message(chat_id=chat_id,text=texto,parse_mode="HTML")
+        try: await _enviar_texto_publico(bot,chat_id,chave_texto,texto)
         except Exception: pass
 
 async def cmd_divorciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1234,12 +1368,13 @@ async def cmd_divorciar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn=get_db(); cur=conn.cursor(); cur.execute("SELECT casado_com FROM usuarios WHERE user_id=%s FOR UPDATE",(user.id,)); row=cur.fetchone()
     partner=row[0] if row else None
     if not partner:
-        conn.rollback(); cur.close(); conn.close(); await msg.reply_text("Seu perfil não mostra um casamento ativo."); return
+        conn.rollback(); cur.close(); conn.close(); await msg.reply_text(obter_texto_publico("casamento_sem_ativo"),parse_mode="HTML"); return
     a,b=sorted((user.id,partner)); cur.execute("SELECT chat_id FROM casamentos WHERE usuario_a=%s AND usuario_b=%s AND ativo=TRUE ORDER BY id DESC LIMIT 1",(a,b)); marriage=cur.fetchone(); group_chat=marriage[0] if marriage else msg.chat_id
     cur.execute("UPDATE usuarios SET casado_com=NULL WHERE user_id=ANY(%s)",([user.id,partner],))
     cur.execute("UPDATE casamentos SET ativo=FALSE,encerrado_em=NOW() WHERE usuario_a=%s AND usuario_b=%s AND ativo=TRUE",(a,b)); conn.commit(); cur.close(); conn.close()
-    await msg.reply_text("💔 Casamento encerrado.")
-    await _notificar_casamento(context.bot,user.id,partner,group_chat,"💔 O casamento foi encerrado.")
+    texto=obter_texto_publico("casamento_divorciado")
+    await msg.reply_text(texto,parse_mode="HTML")
+    await _notificar_casamento(context.bot,user.id,partner,group_chat,texto,"casamento_divorciado")
 
 async def _renderizar_perfil(user_id: int):
     conn = get_db(); cur = conn.cursor()
@@ -1262,15 +1397,11 @@ async def _renderizar_perfil(user_id: int):
     parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else "Solteiro(a)"
     carta = f"{carta_nome} [Tier {carta_tier}]" if carta_nome else "Não definida"
     carta_tags=_texto_tags([carta_id]) if carta_id else ""
-    texto = (
-        f"⠀⢏⢢⣀⡔⡹  ⊹   <b>{esc(display)}</b>\n"
-        f"💧 : {esc(bio.strip() if bio and bio.strip() else 'Bio não definida')}\n"
-        f"♻️ : {int(total_cartas or 0)} cartas no inventário\n"
-        f"🖥 : Nível {nivel} · {int(xp or 0)} XP ({progresso}/100 para o próximo nível)\n"
-        f"🌱 : {esc(musica.strip() if musica and musica.strip() else 'Música favorita não definida')}\n"
-        f"🫧 : {esc(parceiro)}\n\n"
-        f"🖱 : {esc(carta)}" + (f"\n{carta_tags}" if carta_tags else "")
-    )
+    texto = renderizar_template(obter_texto_publico("perfil_texto"),
+        display=esc(display), bio=esc(bio.strip() if bio and bio.strip() else "Bio não definida"),
+        cartas=int(total_cartas or 0), nivel=nivel, xp=int(xp or 0), progresso=progresso,
+        musica=esc(musica.strip() if musica and musica.strip() else "Música favorita não definida"),
+        parceiro=esc(parceiro), carta=esc(carta), tags=(f"\n{carta_tags}" if carta_tags else ""))
     return texto, carta_nome
 
 async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
@@ -6501,30 +6632,42 @@ async def catmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 # GERENCIADOR DE TEXTOS PÚBLICOS, GIF DO /start E EMOJIS PREMIUM (/textos)
 # ==========================================
+def _area_texto_publico(chave: str) -> str:
+    if chave.startswith("studio_"): return "Studio"
+    if chave.startswith("perfil_"): return "/perfil"
+    if chave.startswith("casamento_divor") or chave == "casamento_sem_ativo": return "/divorciar"
+    if chave.startswith("casamento_"): return "/casar"
+    if chave == "start_texto": return "/start"
+    if chave == "comandos_texto": return "/comandos"
+    if chave.startswith("giro") or chave in ("menu_girar","sem_giros"): return "/girar"
+    if chave.startswith("troca_"): return "/trocar"
+    if chave.startswith("doacao_"): return "/doar"
+    if chave.startswith("loja_"): return "/loja"
+    if chave.startswith("wishlist_"): return "/wishlist"
+    return "Público"
+
 def _montar_home_textos(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     tem_midia_start = bool(obter_config_valor("start_media_id", ""))
     status_midia = "✅ GIF/Foto ativo" if tem_midia_start else "➖ Sem mídia"
     chaves = list(TEXTOS_META)
-    page_size = 8
+    page_size = 6
     total_paginas = max(1, (len(chaves) + page_size - 1) // page_size)
     page = max(0, min(page, total_paginas - 1))
 
     texto = (
-        f"📝 <b>Editor de Textos Públicos</b> — Página {page + 1}/{total_paginas}\n\n"
-        "Os textos do jogo, trocas, doações, wishlist, loja e resultados ficam aqui.\n"
+        f"📝 <b>Editor de Textos Públicos e do Studio</b> — Página {page + 1}/{total_paginas}\n\n"
+        "Lista de mensagens por comando/área. Escolha uma linha para editar texto e mídia.\n"
         f"🎞️ <b>Mídia do /start:</b> {status_midia}\n\n"
         "💡 <i>Dica: ao enviar qualquer texto ou emoji de Tier, basta usar os <b>Emojis Premium do Telegram</b> normalmente no teclado que o bot salva o ID animado automaticamente!</i>"
     )
 
     botoes = []
-    linha = []
-    for chave in chaves[page * page_size:(page + 1) * page_size]:
-        linha.append(InlineKeyboardButton(TEXTOS_META[chave]["titulo"][:48], callback_data=f"txmgr|item|{chave}"))
-        if len(linha) == 2:
-            botoes.append(linha)
-            linha = []
-    if linha:
-        botoes.append(linha)
+    itens=chaves[page * page_size:(page + 1) * page_size]
+    inicio=page*page_size+1
+    texto += "\n".join(f"<b>{index:02d}.</b> {_area_texto_publico(chave)} — {TEXTOS_META[chave]['titulo']}" for index,chave in enumerate(itens,start=inicio))
+    texto += "\n\nToque no número correspondente para editar:"
+    for index,chave in enumerate(itens,start=inicio):
+        botoes.append([InlineKeyboardButton(f"✏️ Editar {index:02d}", callback_data=f"txmgr|item|{chave}")])
     if total_paginas > 1:
         nav = []
         if page > 0:
@@ -6555,10 +6698,14 @@ def _montar_view_texto(chave: str) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("✏️ Editar Texto", callback_data="txmgr|edit"),
             InlineKeyboardButton("🔄 Restaurar Padrão", callback_data="txmgr|reset"),
         ],
-        [
-            InlineKeyboardButton("⬅️ Voltar", callback_data="txmgr|home"),
-        ],
     ]
+    if meta.get("media"):
+        media_id=obter_config_valor(f"texto_midia_{chave}_id","")
+        media_status="✅ GIF/Foto associado" if media_id else "➖ Sem GIF/Foto"
+        texto += f"\n\n<b>Mídia:</b> {media_status}"
+        botoes.append([InlineKeyboardButton("🎞 Enviar GIF/Foto",callback_data=f"txmgr|text_media|{chave}")])
+        if media_id: botoes.append([InlineKeyboardButton("🗑 Remover GIF/Foto",callback_data=f"txmgr|del_text_media|{chave}")])
+    botoes.append([InlineKeyboardButton("⬅️ Voltar à lista", callback_data="txmgr|home")])
     return texto, InlineKeyboardMarkup(botoes)
 
 def _montar_view_start_media() -> tuple[str, InlineKeyboardMarkup]:
@@ -6604,7 +6751,7 @@ async def txmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != context.user_data.get("admin_id") or not eh_editor(query.from_user.id):
+    if query.from_user.id != context.user_data.get("admin_id") or not tem_permissao(query.from_user.id,"textos"):
         await query.answer("Esse menu pertence a outro admin.", show_alert=True)
         return TX_HOME
 
@@ -6641,6 +6788,24 @@ async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         texto, markup = _montar_view_texto(chave)
         await query.edit_message_text(texto, reply_markup=markup, parse_mode="HTML")
+        return TX_VIEW
+
+    if acao == "text_media":
+        chave=partes[2]
+        if not TEXTOS_META.get(chave,{}).get("media"):
+            await query.answer("Esse texto não aceita mídia.",show_alert=True); return TX_VIEW
+        context.user_data["tx_media_chave"]=chave
+        await query.answer()
+        await query.message.reply_text(f"Envie agora um GIF ou foto para acompanhar <b>{TEXTOS_META[chave]['titulo']}</b>.",parse_mode="HTML")
+        return TX_START_MEDIA
+
+    if acao == "del_text_media":
+        chave=partes[2]
+        remover_config_valor(f"texto_midia_{chave}_id"); remover_config_valor(f"texto_midia_{chave}_type")
+        context.user_data.pop("tx_media_chave",None)
+        await query.answer("Mídia removida.")
+        texto,markup=_montar_view_texto(chave)
+        await query.edit_message_text(texto,reply_markup=markup,parse_mode="HTML")
         return TX_VIEW
 
     if acao == "edit":
@@ -6725,16 +6890,22 @@ async def txmgr_receber_start_media(update: Update, context: ContextTypes.DEFAUL
         return TX_START_MEDIA
 
     msg = update.message
+    chave=context.user_data.pop("tx_media_chave",None)
+    prefix=f"texto_midia_{chave}" if chave else "start_media"
     if msg.animation:
-        salvar_config_valor("start_media_id", msg.animation.file_id)
-        salvar_config_valor("start_media_type", "animation")
+        salvar_config_valor(f"{prefix}_id", msg.animation.file_id)
+        salvar_config_valor(f"{prefix}_type", "animation")
     elif msg.photo:
-        salvar_config_valor("start_media_id", msg.photo[-1].file_id)
-        salvar_config_valor("start_media_type", "photo")
+        salvar_config_valor(f"{prefix}_id", msg.photo[-1].file_id)
+        salvar_config_valor(f"{prefix}_type", "photo")
     else:
         await msg.reply_text("⚠️ Envie um <b>GIF</b> ou <b>Foto</b> válido.", parse_mode="HTML")
         return TX_START_MEDIA
 
+    if chave:
+        texto,markup=_montar_view_texto(chave)
+        await msg.reply_text(texto,reply_markup=markup,parse_mode="HTML")
+        return TX_VIEW
     texto, markup = _montar_view_start_media()
     await msg.reply_text(texto, reply_markup=markup, parse_mode="HTML")
     return TX_START_MEDIA
@@ -6825,11 +6996,7 @@ def _studio_teclado(page: int, user_id: int) -> InlineKeyboardMarkup:
 
 async def _mostrar_studio(target, user_id: int, page: int = 0):
     editor_only = not eh_admin(user_id)
-    texto = ("🎛️ <b>Ecco-Mix Studio</b>\n\n" if not editor_only else "📝 <b>Editor do Studio</b>\n\n")
-    if not editor_only:
-        texto += "🎲 <b>Giros:</b> 10 giros diários; reposição à meia-noite (horário de São Paulo). Os giros acumulam.\n\nEscolha uma seção:"
-    else:
-        texto += "Edite os textos públicos e gerencie tags de artistas/personagens em lote."
+    texto = obter_texto_publico("studio_inicio_editor" if editor_only else "studio_inicio_admin")
     await target.reply_text(texto, reply_markup=_studio_teclado(page, user_id), parse_mode="HTML")
 
 async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6851,7 +7018,7 @@ async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if action == "page":
         page = int(p[2]); await q.answer()
         if eh_admin(q.from_user.id):
-            texto = f"🎛️ <b>Ecco-Mix Studio · Página {page+1}/3</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam."
+            texto = renderizar_template(obter_texto_publico("studio_pagina"),pagina=page+1)
             await q.edit_message_text(texto, reply_markup=_studio_teclado(page, q.from_user.id), parse_mode="HTML")
         else:
             await q.edit_message_text("📝 Studio · Acesso parcial", reply_markup=_studio_teclado(page, q.from_user.id))
@@ -7086,7 +7253,7 @@ async def studio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Apenas a equipe autorizada pode abrir o Studio.", show_alert=True)
         return
     await query.answer()
-    texto_studio = "🎛️ <b>Ecco-Mix Studio</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam." if eh_admin(query.from_user.id) else "📝 Editor do Studio"
+    texto_studio = obter_texto_publico("studio_inicio_admin" if eh_admin(query.from_user.id) else "studio_inicio_editor")
     await query.edit_message_text(texto_studio, reply_markup=_studio_teclado(0, query.from_user.id), parse_mode="HTML")
     return
     teclado = InlineKeyboardMarkup([
@@ -8059,11 +8226,11 @@ async def main():
         ],
         states={
             TX_HOME: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(item\||page\||noop$|start_media$|tiers$|close$)")],
-            TX_VIEW: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(edit$|reset$|home$)")],
+            TX_VIEW: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(edit$|reset$|home$|text_media\||del_text_media\|)")],
             TX_EDIT_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, txmgr_receber_texto)],
             TX_START_MEDIA: [
                 MessageHandler(filters.ANIMATION | filters.PHOTO, txmgr_receber_start_media),
-                CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(del_start_media$|home$)"),
+                CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(del_start_media$|del_text_media\||home$)"),
             ],
             TX_TIERS_MENU: [CallbackQueryHandler(txmgr_callback, pattern=r"^txmgr\|(tier\||home$)")],
             TX_TIER_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, txmgr_receber_tier_emoji)],
@@ -8093,6 +8260,7 @@ async def main():
     # Comandos de Jogadores
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler(["comandos", "comados"], cmd_comandos))
+    app.add_handler(CallbackQueryHandler(callback_comandos, pattern=r"^comandos\|"))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
     app.add_handler(CommandHandler("perfil", cmd_perfil))
     app.add_handler(CallbackQueryHandler(callback_perfil, pattern=r"^perfil\|"))
@@ -8193,24 +8361,32 @@ async def main():
     asyncio.create_task(loop_reposicao_diaria())
 
     await app.bot.set_my_commands([
+        BotCommand("start", "Abrir o bot"),
+        BotCommand("ajuda", "Abrir o bot"),
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
         BotCommand("apelido", "Definir seu apelido único no jogo"),
         BotCommand("perfil", "Ver e editar seu perfil"),
         BotCommand("casar", "Propor casamento a outro jogador"),
         BotCommand("divorciar", "Encerrar seu casamento"),
         BotCommand("comandos", "Ver todos os comandos disponíveis"),
+        BotCommand("comados", "Ver todos os comandos disponíveis"),
+        BotCommand("meuid", "Ver seu ID numérico"),
         BotCommand("colecao", "Ver toda a sua coleção"),
+        BotCommand("col", "Ver coleção por tag"),
         BotCommand("catalogo", "Listar cartas por categoria"),
-        BotCommand("artista", "Ver progresso dos 5 tiers de um artista"),
+        BotCommand("cartas", "Listar cartas por categoria"),
+        BotCommand("artista", "Ver progresso nos tiers de um artista"),
         BotCommand("ranking", "Ver ranking de jogadores de um artista"),
-        BotCommand("carta", "Visualizar uma carta pelo ID"),
+        BotCommand("top", "Ver ranking de jogadores de um artista"),
+        BotCommand("tag", "Ver coleção ou catálogo de uma tag"),
+        BotCommand("carta", "Visualizar uma carta por ID ou nome"),
         BotCommand("trocar", "Propor troca de cartas"),
         BotCommand("doar", "Doar cartas por botões"),
         BotCommand("wishlist", "Editar ou consultar wishlist"),
         BotCommand("loja", "Vender cartas e comprar giros"),
         BotCommand("eventos", "Ver eventos ativos"),
         BotCommand("natalpresente", "Presentear uma carta de Natal"),
-        BotCommand("meuid", "Ver seu ID numérico"),
+        BotCommand("pular", "Pular a dedicatória opcional de um presente"),
     ])
 
     await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
