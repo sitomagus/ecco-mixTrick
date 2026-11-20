@@ -490,7 +490,13 @@ def iniciar_banco():
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY
+            user_id BIGINT PRIMARY KEY,
+            funcao TEXT NOT NULL DEFAULT 'admin' CHECK (funcao IN ('admin','editor'))
+        );
+        CREATE TABLE IF NOT EXISTS banimentos (
+            user_id BIGINT PRIMARY KEY,
+            aplicado_por BIGINT NOT NULL,
+            criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS categorias (
             id SERIAL PRIMARY KEY,
@@ -562,6 +568,7 @@ def iniciar_banco():
     """)
 
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aqua_coins INTEGER NOT NULL DEFAULT 0;")
+    cur.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS funcao TEXT NOT NULL DEFAULT 'admin';")
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';")
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp BIGINT NOT NULL DEFAULT 0;")
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp_ultimo_em TIMESTAMPTZ;")
@@ -698,11 +705,19 @@ def eh_admin(user_id: int) -> bool:
         return True
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM admins WHERE user_id = %s", (user_id,))
+    cur.execute("SELECT 1 FROM admins WHERE user_id = %s AND funcao = 'admin'", (user_id,))
     achou = cur.fetchone() is not None
     cur.close()
     conn.close()
     return achou
+
+def eh_editor(user_id: int) -> bool:
+    if user_id in SUPER_ADMINS:
+        return True
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT funcao FROM admins WHERE user_id=%s", (user_id,))
+    row = cur.fetchone(); cur.close(); conn.close()
+    return bool(row and row[0] in ("admin", "editor"))
 
 def _hoje_sao_paulo() -> date:
     return datetime.now(FUSO_GIROS).date()
@@ -3057,6 +3072,8 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
     user = update.effective_user
     if not msg or not user or not msg.text:
         return
+    if await handler_banimento_pesquisa(update, context):
+        raise ApplicationHandlerStop
     if await _handler_texto_perfil(update, context):
         raise ApplicationHandlerStop
     if context.user_data.get("evento_pendente"):
@@ -5901,7 +5918,7 @@ def _montar_view_tiers_emojis() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(linhas), InlineKeyboardMarkup(botoes)
 
 async def txmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not eh_admin(update.effective_user.id):
+    if not eh_editor(update.effective_user.id):
         return ConversationHandler.END
 
     context.user_data.clear()
@@ -5918,7 +5935,7 @@ async def txmgr_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def txmgr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != context.user_data.get("admin_id"):
+    if query.from_user.id != context.user_data.get("admin_id") or not eh_editor(query.from_user.id):
         await query.answer("Esse menu pertence a outro admin.", show_alert=True)
         return TX_HOME
 
@@ -6083,9 +6100,186 @@ async def txmgr_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bloqueio_nao_admin(update: Update) -> bool:
     return not eh_admin(update.effective_user.id)
 
-async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await bloqueio_nao_admin(update):
+def _studio_teclado(page: int, user_id: int) -> InlineKeyboardMarkup:
+    if not eh_admin(user_id):
+        return InlineKeyboardMarkup([[InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")]])
+    page = max(0, min(2, page))
+    botoes = []
+    if page == 0:
+        botoes = [
+            [InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta"), InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta")],
+            [InlineKeyboardButton("🗂️ Categorias", callback_data="studio_go|categorias"), InlineKeyboardButton("📚 Catálogo", callback_data="studio_go|catalogo")],
+            [InlineKeyboardButton("📦 Mover artista", callback_data="studio_go|moverartista")],
+        ]
+    elif page == 1:
+        botoes = [
+            [InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],
+            [InlineKeyboardButton("🖼️ Molduras", callback_data="studio_ui|molduras"), InlineKeyboardButton("🎉 Eventos", callback_data="evento|admin")],
+        ]
+    else:
+        botoes = [
+            [InlineKeyboardButton("👥 Ver administradores", callback_data="studio_ui|admins|0")],
+            [InlineKeyboardButton("🚫 Banimentos", callback_data="studio_ui|ban")],
+            [InlineKeyboardButton("🎲 Dar giros", callback_data="studio_ui|help_dargiros"), InlineKeyboardButton("🧹 Zerar inventários", callback_data="studio_ui|help_deleteall")],
+        ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"studio_ui|page|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/3", callback_data="studio_ui|noop"))
+    if page < 2:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"studio_ui|page|{page+1}"))
+    botoes.append(nav)
+    return InlineKeyboardMarkup(botoes)
+
+async def _mostrar_studio(target, user_id: int, page: int = 0):
+    editor_only = not eh_admin(user_id)
+    texto = ("🎛️ <b>Ecco-Mix Studio</b>\n\n" if not editor_only else "📝 <b>Editor do Studio</b>\n\n")
+    if not editor_only:
+        texto += "🎲 <b>Giros:</b> 10 giros diários; reposição à meia-noite (horário de São Paulo). Os giros acumulam.\n\nEscolha uma seção:"
+    else:
+        texto += "Edite os textos públicos e as mensagens do painel administrativo."
+    await target.reply_text(texto, reply_markup=_studio_teclado(page, user_id), parse_mode="HTML")
+
+async def studio_ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not eh_editor(q.from_user.id):
+        await q.answer("Apenas equipe autorizada.", show_alert=True); return
+    p = q.data.split("|"); action = p[1]
+    if action not in ("noop", "page") and not eh_admin(q.from_user.id):
+        await q.answer("Apenas administradores.", show_alert=True); return
+    if action == "noop":
+        await q.answer(); return
+    if action == "page":
+        page = int(p[2]); await q.answer()
+        if eh_admin(q.from_user.id):
+            texto = f"🎛️ <b>Ecco-Mix Studio · Página {page+1}/3</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam."
+            await q.edit_message_text(texto, reply_markup=_studio_teclado(page, q.from_user.id), parse_mode="HTML")
+        else:
+            await q.edit_message_text("📝 Editor do Studio", reply_markup=_studio_teclado(1, q.from_user.id))
         return
+    if action == "molduras":
+        if not eh_admin(q.from_user.id):
+            await q.answer("Apenas administradores.", show_alert=True); return
+        conn=get_db(); cur=conn.cursor(); cur.execute("SELECT tier FROM molduras"); active={r[0] for r in cur.fetchall()}; cur.close(); conn.close()
+        rows=[[InlineKeyboardButton(f"{'✅' if t in active else '➕'} {TIERS_CONFIG[t]['nome']}",callback_data=f"studio_ui|molduratri|{t}")] for t in range(1,7)]
+        rows.append([InlineKeyboardButton("⬅️ Studio",callback_data="studio_ui|page|1")])
+        await q.answer(); await q.edit_message_text("🖼️ <b>Molduras por tier</b>\nEscolha um tier para enviar/substituir a moldura. O arquivo precisa ser PNG.",reply_markup=InlineKeyboardMarkup(rows),parse_mode="HTML"); return
+    if action == "molduratri":
+        tier=int(p[2]); conn=get_db(); cur=conn.cursor(); cur.execute("SELECT 1 FROM molduras WHERE tier=%s",(tier,)); active=cur.fetchone() is not None; cur.close(); conn.close()
+        buttons=[[InlineKeyboardButton("📤 Enviar/substituir PNG",callback_data=f"studio_ui|moldurafile|{tier}")]]
+        if active: buttons.append([InlineKeyboardButton("🗑 Remover moldura",callback_data=f"studio_ui|molduradel|{tier}")])
+        buttons.append([InlineKeyboardButton("⬅️ Voltar",callback_data="studio_ui|molduras")])
+        await q.answer(); await q.edit_message_text(f"Moldura de <b>{TIERS_CONFIG[tier]['nome']}</b>",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML"); return
+    if action == "moldurafile":
+        tier=int(p[2]); context.user_data["studio_moldura_pendente"] = tier; await q.answer()
+        await q.message.reply_text(f"Envie um arquivo PNG para definir a moldura de {TIERS_CONFIG[tier]['nome']}."); return
+    if action == "molduradel":
+        tier=int(p[2]); conn=get_db(); cur=conn.cursor(); cur.execute("DELETE FROM molduras WHERE tier=%s",(tier,)); conn.commit(); cur.close(); conn.close()
+        count=await _regenerar_cartas_moldura_tier(context,tier,None,q.message.chat_id)
+        await q.answer("Moldura removida."); await q.message.reply_text(f"Moldura removida; {count} carta(s) restauradas à imagem original."); return
+    if action == "admins":
+        await _mostrar_lista_admins(q, int(p[2])); return
+    if action == "ban":
+        if not eh_admin(q.from_user.id):
+            await q.answer("Apenas administradores.", show_alert=True); return
+        await _mostrar_banimentos(q,0); return
+    if action == "bansearch":
+        context.user_data["studio_ban_busca"] = True; await q.answer(); await q.message.reply_text("Pesquise pelo @, apelido ou ID do jogador:"); return
+    if action == "banpage":
+        await _mostrar_banimentos(q,int(p[2])); return
+    if action in ("banconfirm","unban"):
+        if not eh_admin(q.from_user.id):
+            await q.answer("Apenas administradores.", show_alert=True); return
+        uid=int(p[2]); conn=get_db(); cur=conn.cursor()
+        if action == "banconfirm":
+            cur.execute("INSERT INTO banimentos(user_id,aplicado_por) VALUES(%s,%s) ON CONFLICT(user_id) DO NOTHING",(uid,q.from_user.id))
+        else:
+            cur.execute("DELETE FROM banimentos WHERE user_id=%s",(uid,))
+        conn.commit(); cur.close(); conn.close(); await q.answer("Banimento atualizado."); await _mostrar_banimentos(q,0); return
+    if action in ("help_dargiros","help_deleteall"):
+        command="/dargiros qtd (respondendo à pessoa) ou /dargiros ID qtd" if action=="help_dargiros" else "/deleteall"
+        await q.answer(); await q.message.reply_text(f"Use {command}."); return
+
+async def _mostrar_lista_admins(q, page: int = 0):
+    if not eh_admin(q.from_user.id):
+        await q.answer("Apenas administradores.", show_alert=True); return
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT a.user_id,a.funcao,u.username FROM admins a LEFT JOIN usuarios u ON u.user_id=a.user_id ORDER BY a.funcao,a.user_id")
+    rows=cur.fetchall(); cur.close(); conn.close()
+    for sid in SUPER_ADMINS:
+        if not any(r[0]==sid for r in rows):
+            conn=get_db(); cur=conn.cursor(); cur.execute("SELECT username FROM usuarios WHERE user_id=%s",(sid,)); user_row=cur.fetchone(); cur.close(); conn.close()
+            rows.insert(0,(sid,"admin",user_row[0] if user_row else None))
+    size=10; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1)); chunk=rows[page*size:(page+1)*size]
+    lines=["👥 <b>Equipe do bot</b>"]
+    for uid,role,username in chunk:
+        lines.append(f"• <code>{uid}</code> · {('@'+username) if username else 'sem @'} · {'ADM (todas as permissões)' if role=='admin' else 'Editor (textos públicos e do painel)'}")
+    buttons=[]; nav=[]
+    if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"studio_ui|admins|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="studio_ui|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"studio_ui|admins|{page+1}"))
+    buttons.append(nav); buttons.append([InlineKeyboardButton("⬅️ Studio",callback_data="studio_ui|page|2")])
+    await q.answer(); await q.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+
+async def _mostrar_banimentos(q, page: int = 0):
+    if not eh_admin(q.from_user.id):
+        await q.answer("Apenas administradores.", show_alert=True); return
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("SELECT b.user_id,u.username,u.apelido FROM banimentos b LEFT JOIN usuarios u ON u.user_id=b.user_id ORDER BY b.criado_em DESC")
+    rows=cur.fetchall(); cur.close(); conn.close()
+    size=10; pages=max(1,(len(rows)+size-1)//size); page=max(0,min(page,pages-1)); chunk=rows[page*size:(page+1)*size]
+    buttons=[[InlineKeyboardButton(f"Desbanir {alias or ('@'+username if username else uid)} · {uid}",callback_data=f"studio_ui|unban|{uid}")] for uid,username,alias in chunk]
+    buttons.append([InlineKeyboardButton("🔍 Banir jogador",callback_data="studio_ui|bansearch")])
+    nav=[]
+    if page: nav.append(InlineKeyboardButton("⬅️",callback_data=f"studio_ui|banpage|{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{pages}",callback_data="studio_ui|noop"))
+    if page+1<pages: nav.append(InlineKeyboardButton("➡️",callback_data=f"studio_ui|banpage|{page+1}"))
+    buttons.append(nav); buttons.append([InlineKeyboardButton("⬅️ Studio",callback_data="studio_ui|page|2")])
+    await q.answer(); await q.edit_message_text("🚫 <b>Banimentos</b>\nEscolha um jogador banido para remover o bloqueio ou pesquise para banir.",reply_markup=InlineKeyboardMarkup(buttons),parse_mode="HTML")
+
+async def handler_banimento_pesquisa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.effective_message; uid=update.effective_user.id
+    if not context.user_data.get("studio_ban_busca") or not msg or not msg.text: return False
+    context.user_data["studio_ban_busca"]=False
+    alvo=await _buscar_usuario_perfil(msg.text.strip())
+    if not alvo:
+        await msg.reply_text("Não encontrei essa pessoa. Ela precisa ter iniciado o bot."); return True
+    if eh_admin(alvo):
+        await msg.reply_text("Não é possível banir um administrador."); return True
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT username,apelido FROM usuarios WHERE user_id=%s",(alvo,)); row=cur.fetchone(); cur.close(); conn.close()
+    nome=(row[1] or ("@"+row[0] if row and row[0] else str(alvo))) if row else str(alvo)
+    await msg.reply_text(f"Banir <b>{esc(nome)}</b> (<code>{alvo}</code>) do uso do bot?",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Confirmar banimento",callback_data=f"studio_ui|banconfirm|{alvo}")],[InlineKeyboardButton("Cancelar",callback_data="studio_ui|ban")]]),parse_mode="HTML")
+    return True
+
+async def handler_usuario_banido(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user=update.effective_user
+    if not user: return
+    if eh_admin(user.id): return
+    conn=get_db(); cur=conn.cursor(); cur.execute("SELECT 1 FROM banimentos WHERE user_id=%s",(user.id,)); banned=cur.fetchone() is not None; cur.close(); conn.close()
+    if not banned: return
+    if update.callback_query:
+        await update.callback_query.answer("Seu acesso ao bot foi bloqueado.",show_alert=True)
+    elif update.effective_chat and update.effective_chat.type=="private" and update.effective_message:
+        await update.effective_message.reply_text("Seu acesso ao bot foi bloqueado.")
+    raise ApplicationHandlerStop
+
+async def handler_studio_moldura_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tier=context.user_data.get("studio_moldura_pendente"); msg=update.effective_message
+    if tier is None or not eh_admin(update.effective_user.id): return False
+    if not msg or not msg.document or not msg.document.mime_type or "png" not in msg.document.mime_type.lower():
+        await msg.reply_text("Envie a moldura como arquivo PNG transparente."); return True
+    tg=await context.bot.get_file(msg.document.file_id); buf=io.BytesIO(); await tg.download_to_memory(buf); png=buf.getvalue()
+    conn=get_db(); cur=conn.cursor(); cur.execute("INSERT INTO molduras(tier,png_bytes) VALUES(%s,%s) ON CONFLICT(tier) DO UPDATE SET png_bytes=EXCLUDED.png_bytes",(tier,psycopg2.Binary(png))); conn.commit(); cur.close(); conn.close()
+    count=await _regenerar_cartas_moldura_tier(context,tier,png,msg.chat_id)
+    context.user_data.pop("studio_moldura_pendente",None)
+    await msg.reply_text(f"Moldura de {TIERS_CONFIG[tier]['nome']} salva e aplicada em {count} carta(s).")
+    return True
+
+async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_editor(update.effective_user.id):
+        return
+    await _mostrar_studio(update.effective_message, update.effective_user.id, 0)
+    return
     texto = (
         "🎛️ <b>Ecco-Mix Studio (Painel Admin)</b>\n\n"
         "<b>Criar & Gerenciar Cartas:</b>\n"
@@ -6129,9 +6323,13 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def studio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not eh_admin(query.from_user.id):
-        await query.answer("Apenas administradores podem abrir o Studio.", show_alert=True)
+    if not eh_editor(query.from_user.id):
+        await query.answer("Apenas a equipe autorizada pode abrir o Studio.", show_alert=True)
         return
+    await query.answer()
+    texto_studio = "🎛️ <b>Ecco-Mix Studio</b>\n\n🎲 10 giros diários; reposição à meia-noite de São Paulo; giros acumulam." if eh_admin(query.from_user.id) else "📝 Editor do Studio"
+    await query.edit_message_text(texto_studio, reply_markup=_studio_teclado(0, query.from_user.id), parse_mode="HTML")
+    return
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Nova carta", callback_data="studio_go|addcarta"), InlineKeyboardButton("✏️ Editar cartas", callback_data="studio_go|editcarta")],
         [InlineKeyboardButton("📂 Categorias & grupos", callback_data="studio_go|categorias"), InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],
@@ -6838,11 +7036,28 @@ async def cmd_add_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (novo_adm,))
+    cur.execute("INSERT INTO admins (user_id,funcao) VALUES (%s,'admin') ON CONFLICT(user_id) DO UPDATE SET funcao='admin'", (novo_adm,))
     conn.commit()
     cur.close()
     conn.close()
     await update.message.reply_text(f"🛡️ Usuário <code>{novo_adm}</code> agora é administrador.", parse_mode="HTML")
+
+async def cmd_add_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in SUPER_ADMINS:
+        return
+    try:
+        target_id = int(context.args[0])
+    except (IndexError, ValueError):
+        await update.effective_message.reply_text("Uso: <code>/addeditor ID</code>", parse_mode="HTML"); return
+    conn=get_db(); cur=conn.cursor()
+    cur.execute("INSERT INTO admins(user_id,funcao) VALUES(%s,'editor') ON CONFLICT(user_id) DO UPDATE SET funcao='editor'", (target_id,))
+    conn.commit(); cur.close(); conn.close()
+    await update.effective_message.reply_text(f"Editor <code>{target_id}</code> adicionado. Pode editar textos públicos e do painel.", parse_mode="HTML")
+
+async def cmd_ver_adms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not eh_admin(update.effective_user.id):
+        await update.effective_message.reply_text("Apenas administradores podem consultar a equipe."); return
+    await update.effective_message.reply_text("👥 <b>Administradores e editores</b> — use as setas para navegar.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Abrir lista", callback_data="studio_ui|admins|0")]]), parse_mode="HTML")
 
 async def cmd_rem_adm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in SUPER_ADMINS:
@@ -6877,6 +7092,9 @@ async def main():
         .build()
     )
 
+    app.add_handler(MessageHandler(filters.ALL, handler_usuario_banido), group=-1)
+    app.add_handler(CallbackQueryHandler(handler_usuario_banido, pattern=r"."), group=-1)
+
     from eventos import GerenciadorEventos
     eventos_manager = GerenciadorEventos({
         "get_db": get_db, "esc": esc, "eh_admin": eh_admin,
@@ -6889,6 +7107,8 @@ async def main():
     eventos_manager.registrar(app)
 
     async def evento_midia_handler(update, context):
+        if await handler_studio_moldura_media(update, context):
+            return
         if context.user_data.get("evento_pendente"):
             manager = context.application.bot_data.get("eventos_manager")
             if manager:
@@ -7045,6 +7265,7 @@ async def main():
     # Comandos de Admin (Studio)
     app.add_handler(CommandHandler("studio", cmd_studio_help))
     app.add_handler(CallbackQueryHandler(studio_menu_callback, pattern=r"^studio_menu$"))
+    app.add_handler(CallbackQueryHandler(studio_ui_callback, pattern=r"^studio_ui\|"))
     app.add_handler(CommandHandler("moldura", cmd_set_moldura))
     app.add_handler(CommandHandler("remmoldura", cmd_rem_moldura))
     app.add_handler(CommandHandler("molduras", cmd_status_molduras))
@@ -7058,6 +7279,8 @@ async def main():
     app.add_handler(CommandHandler("dargiros", cmd_dar_giros))
     app.add_handler(CommandHandler("addadm", cmd_add_adm))
     app.add_handler(CommandHandler("remadm", cmd_rem_adm))
+    app.add_handler(CommandHandler("addeditor", cmd_add_editor))
+    app.add_handler(CommandHandler("veradms", cmd_ver_adms))
 
     # Botões Interativos do Jogo
     app.add_handler(CallbackQueryHandler(callback_girar_categoria, pattern=r"^rcat\|"))
