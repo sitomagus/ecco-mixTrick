@@ -157,7 +157,7 @@ TEXTOS_PADRAO = {
         "⠀⢏⢢⣀⡔⡹  ⊹   <b>{display}</b>\n"
         "💧 : {bio}\n♻️ : {cartas} cartas no inventário\n"
         "🖥 : Nível {nivel} · {xp} XP ({progresso}/100 para o próximo nível)\n"
-        "🌱 : {musica}\n🫧 : {parceiro}\n\n🖱 : {carta}{tags}"
+        "🌱 : {musica}\n🖱 : {carta}{tags}\n{parceiro}"
     ),
     "casamento_proposta": "💌 <b>Proposta de casamento</b>\n{remetente} quer se casar com você.",
     "casamento_enviada": "💌 Proposta enviada no privado. A pessoa pode aceitar ou recusar por lá.",
@@ -1394,14 +1394,20 @@ async def _renderizar_perfil(user_id: int):
     display = (apelido or "").strip() or (f"@{username}" if username else f"Mixer #{str(user_id)[-4:]}")
     nivel = int(xp or 0) // 100 + 1
     progresso = int(xp or 0) % 100
-    parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else "Solteiro(a)"
+    nome_parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else None
+    # Coelhinhos em ASCII com barras invertidas costumam perder/embaralhar as
+    # orelhas no renderizador do Telegram. Estes glifos mantêm o desenho estável.
+    parceiro = (
+        f"🫧 ꒰ᐢ. .ᐢ꒱ 💍 ꒰ᐢ. .ᐢ꒱\nMeu coração pertence a <b>{esc(nome_parceiro)}</b>"
+        if nome_parceiro else "🫧 Solteiro(a)"
+    )
     carta = f"{carta_nome} [Tier {carta_tier}]" if carta_nome else "Não definida"
     carta_tags=_texto_tags([carta_id]) if carta_id else ""
     texto = renderizar_template(obter_texto_publico("perfil_texto"),
         display=esc(display), bio=esc(bio.strip() if bio and bio.strip() else "Bio não definida"),
         cartas=int(total_cartas or 0), nivel=nivel, xp=int(xp or 0), progresso=progresso,
         musica=esc(musica.strip() if musica and musica.strip() else "Música favorita não definida"),
-        parceiro=esc(parceiro), carta=esc(carta), tags=(f"\n{carta_tags}" if carta_tags else ""))
+        parceiro=parceiro, carta=esc(carta), tags=(f"\n{carta_tags}" if carta_tags else ""))
     return texto, carta_nome
 
 async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
