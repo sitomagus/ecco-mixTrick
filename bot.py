@@ -562,6 +562,12 @@ def iniciar_banco():
     """)
 
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aqua_coins INTEGER NOT NULL DEFAULT 0;")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT '';")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp BIGINT NOT NULL DEFAULT 0;")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS xp_ultimo_em TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS musica_favorita TEXT NOT NULL DEFAULT '';")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS carta_favorita_id INTEGER REFERENCES cartas(id) ON DELETE SET NULL;")
+    cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS casado_com BIGINT REFERENCES usuarios(user_id) ON DELETE SET NULL;")
     cur.execute("ALTER TABLE trocas ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT;")
     cur.execute("ALTER TABLE cartas DROP CONSTRAINT IF EXISTS cartas_tier_check;")
     cur.execute("ALTER TABLE cartas ADD CONSTRAINT cartas_tier_check CHECK (tier BETWEEN 1 AND 6);")
@@ -958,6 +964,7 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verificar_usuario(user.id, user.username)
     texto = obter_texto_publico("comandos_texto")
     comandos_novos = [
+        ("/perfil", "• /perfil [@pessoa] — Ver e editar seu perfil, XP e carta favorita"),
         ("/eventos", "• /eventos — Abrir eventos ativos e suas cartas especiais"),
         ("/natalpresente", "• /natalpresente @pessoa — Presentear cartas do evento de Natal"),
         ("/trocar", "• /trocar <code>@pessoa</code> ou apelido — Propor troca escolhendo cartas pelos botões"),
@@ -1031,6 +1038,150 @@ async def cmd_apelido(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Apelido atualizado para: 🫧 <b>{esc(novo_apelido)}</b>",
         parse_mode="HTML"
     )
+
+async def _buscar_usuario_perfil(identificador: str):
+    valor = identificador.strip()
+    if not valor:
+        return None
+    valor_sem_arroba = valor.lstrip("@").strip()
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT user_id FROM usuarios WHERE user_id::text=%s OR LOWER(username)=LOWER(%s) OR LOWER(TRIM(apelido))=LOWER(%s) LIMIT 1", (valor_sem_arroba, valor_sem_arroba, valor))
+    row = cur.fetchone(); cur.close(); conn.close()
+    return row[0] if row else None
+
+async def _renderizar_perfil(user_id: int):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("""
+        SELECT u.apelido,u.username,u.bio,u.xp,u.musica_favorita,u.casado_com,
+               COALESCE((SELECT SUM(i.quantidade) FROM inventario i WHERE i.user_id=u.user_id),0),
+               fc.nome,fc.tier,par.apelido,par.username
+        FROM usuarios u
+        LEFT JOIN cartas fc ON fc.id=u.carta_favorita_id
+        LEFT JOIN usuarios par ON par.user_id=u.casado_com
+        WHERE u.user_id=%s
+    """, (user_id,))
+    row = cur.fetchone(); cur.close(); conn.close()
+    if not row:
+        return None, None
+    apelido, username, bio, xp, musica, parceiro_id, total_cartas, carta_nome, carta_tier, parceiro_apelido, parceiro_username = row
+    display = (apelido or "").strip() or (f"@{username}" if username else f"Mixer #{str(user_id)[-4:]}")
+    nivel = int(xp or 0) // 100 + 1
+    progresso = int(xp or 0) % 100
+    parceiro = (parceiro_apelido or (f"@{parceiro_username}" if parceiro_username else "Jogador")) if parceiro_id else "Solteiro(a)"
+    carta = f"{carta_nome} [Tier {carta_tier}]" if carta_nome else "Não definida"
+    texto = (
+        f"⠀⢏⢢⣀⡔⡹  ⊹   <b>{esc(display)}</b>\n"
+        f"💧 : {esc(bio.strip() if bio and bio.strip() else 'Bio não definida')}\n"
+        f"♻️ : {int(total_cartas or 0)} cartas no inventário\n"
+        f"🖥 : Nível {nivel} · {int(xp or 0)} XP ({progresso}/100 para o próximo nível)\n"
+        f"🌱 : {esc(musica.strip() if musica and musica.strip() else 'Música favorita não definida')}\n"
+        f"🫧 : {esc(parceiro)}\n\n"
+        f"🖱 : {esc(carta)}"
+    )
+    return texto, carta_nome
+
+async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
+    texto, _ = await _renderizar_perfil(user_id)
+    if texto is None:
+        if hasattr(target, "reply_text"):
+            await target.reply_text("Ainda não encontrei esse perfil. A pessoa precisa iniciar o bot com /start.")
+        else:
+            await target.edit_message_text("Ainda não encontrei esse perfil. A pessoa precisa iniciar o bot com /start.")
+        return
+    markup = None
+    if permitir_edicao:
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💧 Editar bio", callback_data="perfil|editar|bio"), InlineKeyboardButton("🌱 Música favorita", callback_data="perfil|editar|musica")],
+            [InlineKeyboardButton("🖱 Escolher carta favorita", callback_data="perfil|buscarcarta")],
+        ])
+    if hasattr(target, "reply_text"):
+        await target.reply_text(texto, parse_mode="HTML", reply_markup=markup)
+    else:
+        await target.edit_message_text(texto, parse_mode="HTML", reply_markup=markup)
+
+async def cmd_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message; user = update.effective_user
+    if not msg or not user:
+        return
+    verificar_usuario(user.id, user.username)
+    target_id = user.id
+    identificador = " ".join(context.args).strip()
+    if not identificador and msg.reply_to_message and msg.reply_to_message.from_user:
+        alvo = msg.reply_to_message.from_user
+        target_id = alvo.id
+        verificar_usuario(alvo.id, alvo.username)
+    elif identificador:
+        encontrado = await _buscar_usuario_perfil(identificador)
+        if not encontrado:
+            await msg.reply_text("Não encontrei esse jogador. Ele precisa iniciar o bot com /start.")
+            return
+        target_id = encontrado
+    context.user_data["perfil_visualizado"] = target_id
+    await _mostrar_perfil(msg, context, target_id, target_id == user.id)
+
+async def callback_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; partes = q.data.split("|")
+    dono = context.user_data.get("perfil_visualizado")
+    if dono != q.from_user.id:
+        await q.answer("Abra seu próprio /perfil para editar.", show_alert=True); return
+    acao = partes[1]
+    if acao == "cancelar":
+        context.user_data.pop("perfil_pendente", None)
+        await q.answer("Busca cancelada.")
+        await q.edit_message_reply_markup(reply_markup=None)
+        return
+    if acao == "editar":
+        campo = partes[2]
+        context.user_data["perfil_pendente"] = campo
+        await q.answer()
+        prompt = "Envie sua bio (até 160 caracteres). Digite limpar para apagar." if campo == "bio" else "Envie o nome da sua música favorita (até 100 caracteres). Digite limpar para apagar."
+        await q.message.reply_text(prompt)
+        return
+    if acao == "buscarcarta":
+        context.user_data["perfil_pendente"] = "carta_busca"
+        await q.answer()
+        await q.message.reply_text("Digite o nome da carta para pesquisar.")
+        return
+    if acao == "carta":
+        carta_id = int(partes[2]); conn = get_db(); cur = conn.cursor()
+        cur.execute("UPDATE usuarios SET carta_favorita_id=%s WHERE user_id=%s", (carta_id, dono)); conn.commit(); cur.close(); conn.close()
+        await q.answer("Carta favorita atualizada!")
+        await _mostrar_perfil(q.message, context, dono, True)
+
+async def _handler_texto_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pendente = context.user_data.get("perfil_pendente"); msg = update.effective_message
+    if not pendente or not msg or not msg.text:
+        return False
+    valor = "" if msg.text.strip().lower() == "limpar" else msg.text.strip()
+    if pendente == "carta_busca":
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT id,nome,tier FROM cartas WHERE nome ILIKE %s ORDER BY nome,tier,id LIMIT 10", (f"%{valor}%",))
+        rows = cur.fetchall(); cur.close(); conn.close()
+        if not rows:
+            await msg.reply_text("Não encontrei cartas com esse nome. Tente outra busca."); return True
+        botoes = [[InlineKeyboardButton(f"{nome} · Tier {tier}", callback_data=f"perfil|carta|{cid}")] for cid,nome,tier in rows]
+        botoes.append([InlineKeyboardButton("Cancelar", callback_data="perfil|cancelar")])
+        await msg.reply_text("Escolha sua carta favorita:", reply_markup=InlineKeyboardMarkup(botoes))
+        return True
+    limite = 160 if pendente == "bio" else 100
+    if len(valor) > limite:
+        await msg.reply_text(f"O limite é {limite} caracteres. Envie um texto menor."); return True
+    coluna = "bio" if pendente == "bio" else "musica_favorita"
+    conn = get_db(); cur = conn.cursor()
+    cur.execute(f"UPDATE usuarios SET {coluna}=%s WHERE user_id=%s", (valor, update.effective_user.id)); conn.commit(); cur.close(); conn.close()
+    context.user_data.pop("perfil_pendente", None)
+    await msg.reply_text("Perfil atualizado.")
+    await _mostrar_perfil(msg, context, update.effective_user.id, True)
+    return True
+
+async def handler_xp_grupo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message; user = update.effective_user
+    if not msg or not user or user.is_bot or msg.chat.type not in ("group", "supergroup"):
+        return
+    verificar_usuario(user.id, user.username)
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE usuarios SET xp=COALESCE(xp,0)+1,xp_ultimo_em=NOW() WHERE user_id=%s AND (xp_ultimo_em IS NULL OR xp_ultimo_em < NOW()-INTERVAL '1 minute')", (user.id,))
+    conn.commit(); cur.close(); conn.close()
 
 async def cmd_meu_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -2906,6 +3057,8 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
     user = update.effective_user
     if not msg or not user or not msg.text:
         return
+    if await _handler_texto_perfil(update, context):
+        raise ApplicationHandlerStop
     if context.user_data.get("evento_pendente"):
         manager = context.application.bot_data.get("eventos_manager")
         if manager and await manager.processar_texto(update, context):
@@ -6875,6 +7028,8 @@ async def main():
     app.add_handler(CommandHandler(["start", "ajuda"], cmd_start))
     app.add_handler(CommandHandler(["comandos", "comados"], cmd_comandos))
     app.add_handler(CommandHandler("apelido", cmd_apelido))
+    app.add_handler(CommandHandler("perfil", cmd_perfil))
+    app.add_handler(CallbackQueryHandler(callback_perfil, pattern=r"^perfil\|"))
     app.add_handler(CommandHandler("meuid", cmd_meu_id))
     app.add_handler(CommandHandler("girar", cmd_girar))
     app.add_handler(CommandHandler(["catalogo", "cartas"], cmd_catalogo))
@@ -6923,6 +7078,7 @@ async def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.ALL, evento_midia_handler))
     # Listener de quantidade personalizada de giros (group=1 para não conflitar com wizards admin)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_custom_spin_texto), group=1)
+    app.add_handler(MessageHandler(filters.ALL, handler_xp_grupo), group=2)
 
     async def handle_webhook(request):
         try:
@@ -6959,6 +7115,7 @@ async def main():
     await app.bot.set_my_commands([
         BotCommand("girar", "Sortear cartas (ex: /girar, /girar 5, /girar tudo)"),
         BotCommand("apelido", "Definir seu apelido único no jogo"),
+        BotCommand("perfil", "Ver e editar seu perfil"),
         BotCommand("comandos", "Ver todos os comandos disponíveis"),
         BotCommand("colecao", "Ver toda a sua coleção"),
         BotCommand("catalogo", "Listar cartas por categoria"),
