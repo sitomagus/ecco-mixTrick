@@ -1418,17 +1418,18 @@ async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
         else:
             await target.edit_message_text("Ainda não encontrei esse perfil. A pessoa precisa iniciar o bot com /start.")
         return
-    markup = None
     if permitir_edicao:
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("💧 Editar bio", callback_data="perfil|editar|bio"), InlineKeyboardButton("🌱 Música favorita", callback_data="perfil|editar|musica")],
             [InlineKeyboardButton("🖱 Escolher carta favorita", callback_data="perfil|buscarcarta")],
+            [InlineKeyboardButton("💧 Wishlist", callback_data=f"perfil|wishlist|{user_id}")],
         ])
+    else:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("💧 Ver wishlist", callback_data=f"perfil|wishlist|{user_id}")]])
     if hasattr(target, "reply_text"):
         await target.reply_text(texto, parse_mode="HTML", reply_markup=markup)
     else:
         await target.edit_message_text(texto, parse_mode="HTML", reply_markup=markup)
-
 async def cmd_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message; user = update.effective_user
     if not msg or not user:
@@ -1452,6 +1453,23 @@ async def cmd_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; partes = q.data.split("|")
     dono = context.user_data.get("perfil_visualizado")
+    if partes[1] == "wishlist":
+        alvo_id = int(partes[2])
+        if dono != alvo_id:
+            await q.answer("Abra o perfil novamente para ver essa wishlist.", show_alert=True); return
+        texto_wl, markup_wl = _montar_wishlist(alvo_id)
+        botoes = markup_wl.inline_keyboard if markup_wl else []
+        botoes.append([InlineKeyboardButton("🔙 Voltar ao perfil", callback_data=f"perfil|voltar|{alvo_id}")])
+        await q.answer()
+        await q.edit_message_text(texto_wl, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botoes))
+        return
+    if partes[1] == "voltar":
+        alvo_id = int(partes[2])
+        if dono != alvo_id:
+            await q.answer("Abra o perfil novamente para voltar.", show_alert=True); return
+        await q.answer()
+        await _mostrar_perfil(q.message, context, alvo_id, alvo_id == q.from_user.id)
+        return
     if dono != q.from_user.id:
         await q.answer("Abra seu próprio /perfil para editar.", show_alert=True); return
     acao = partes[1]
