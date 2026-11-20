@@ -1424,8 +1424,6 @@ async def _mostrar_perfil(target, context, user_id: int, permitir_edicao: bool):
             [InlineKeyboardButton("💧 Editar bio", callback_data="perfil|editar|bio"), InlineKeyboardButton("🌱 Música favorita", callback_data="perfil|editar|musica")],
             [InlineKeyboardButton("🖱 Escolher carta favorita", callback_data="perfil|buscarcarta")],
         ])
-    else:
-        markup = InlineKeyboardMarkup([[InlineKeyboardButton("💍 Propor casamento",callback_data=f"perfil|casar|{user_id}")]])
     if hasattr(target, "reply_text"):
         await target.reply_text(texto, parse_mode="HTML", reply_markup=markup)
     else:
@@ -1454,11 +1452,6 @@ async def cmd_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_perfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; partes = q.data.split("|")
     dono = context.user_data.get("perfil_visualizado")
-    if partes[1]=="casar":
-        target_id=int(partes[2])
-        if dono!=target_id or target_id==q.from_user.id:
-            await q.answer("Abra o perfil da pessoa que deseja convidar.",show_alert=True); return
-        await q.answer(); await _propor_casamento(update,context,target_id); return
     if dono != q.from_user.id:
         await q.answer("Abra seu próprio /perfil para editar.", show_alert=True); return
     acao = partes[1]
