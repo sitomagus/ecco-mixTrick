@@ -3210,7 +3210,7 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pedido_id = carta_id
         conn = get_db()
         cur = conn.cursor()
-            cur.execute("SELECT c.nome, c.tier, c.event_id FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (pedido_id, fluxo["target_id"]))
+        cur.execute("SELECT c.nome, c.tier, c.event_id FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (pedido_id, fluxo["target_id"]))
         pedida = cur.fetchone()
         cur.execute("SELECT nome, tier FROM cartas WHERE id = %s", (fluxo["offered_id"],))
         oferecida = cur.fetchone()
