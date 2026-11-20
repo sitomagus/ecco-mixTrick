@@ -53,12 +53,14 @@ _CONFIG_CACHE: dict[str, str] = {}
 _CONFIG_LOADED = False
 
 TIERS_CONFIG = {
+    6: {"nome": "SS+ (Ultra raro)", "curto": "SS+", "emoji": "💠", "peso": 1},
     1: {"nome": "Tier 1 (Comum)", "curto": "Tier 1", "emoji": "🌱", "peso": 48},
     2: {"nome": "Tier 2 (Incomum)", "curto": "Tier 2", "emoji": "💧", "peso": 27},
     3: {"nome": "Tier 3 (Raro)", "curto": "Tier 3", "emoji": "🦋", "peso": 15},
     4: {"nome": "Tier 4 (Épico)", "curto": "Tier 4", "emoji": "🔮", "peso": 7},
     5: {"nome": "Tier 5 (Lendário)", "curto": "Tier 5", "emoji": "💠", "peso": 3},
 }
+CHANCE_SS_PLUS = 0.0001
 
 TEXTOS_PADRAO = {
     "start_texto": (
@@ -508,7 +510,7 @@ def iniciar_banco():
             UNIQUE(subcategoria_id, nome)
         );
         CREATE TABLE IF NOT EXISTS molduras (
-            tier INTEGER PRIMARY KEY CHECK (tier BETWEEN 1 AND 5),
+            tier INTEGER PRIMARY KEY CHECK (tier BETWEEN 1 AND 6),
             png_bytes BYTEA NOT NULL
         );
         CREATE TABLE IF NOT EXISTS config_textos (
@@ -530,10 +532,12 @@ def iniciar_banco():
             categoria_id INTEGER NOT NULL REFERENCES categorias(id),
             subcategoria_id INTEGER REFERENCES subcategorias(id),
             subsubcategoria_id INTEGER REFERENCES subsubcategorias(id),
-            tier INTEGER NOT NULL CHECK (tier BETWEEN 1 AND 5),
+            tier INTEGER NOT NULL CHECK (tier BETWEEN 1 AND 6),
             peso_drop INTEGER NOT NULL,
             file_id TEXT NOT NULL,
-            media_type TEXT NOT NULL DEFAULT 'photo'
+            media_type TEXT NOT NULL DEFAULT 'photo',
+            original_file_id TEXT,
+            event_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS inventario (
             id SERIAL PRIMARY KEY,
@@ -559,6 +563,13 @@ def iniciar_banco():
 
     cur.execute("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS aqua_coins INTEGER NOT NULL DEFAULT 0;")
     cur.execute("ALTER TABLE trocas ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT;")
+    cur.execute("ALTER TABLE cartas DROP CONSTRAINT IF EXISTS cartas_tier_check;")
+    cur.execute("ALTER TABLE cartas ADD CONSTRAINT cartas_tier_check CHECK (tier BETWEEN 1 AND 6);")
+    cur.execute("ALTER TABLE molduras DROP CONSTRAINT IF EXISTS molduras_tier_check;")
+    cur.execute("ALTER TABLE molduras ADD CONSTRAINT molduras_tier_check CHECK (tier BETWEEN 1 AND 6);")
+    cur.execute("ALTER TABLE cartas ADD COLUMN IF NOT EXISTS original_file_id TEXT;")
+    cur.execute("ALTER TABLE cartas ADD COLUMN IF NOT EXISTS event_id INTEGER;")
+    cur.execute("UPDATE cartas SET original_file_id = file_id WHERE original_file_id IS NULL;")
 
     cur.execute("""
         SELECT 1 FROM information_schema.columns
@@ -626,6 +637,9 @@ def iniciar_banco():
             )
             if not cur.fetchone():
                 cur.execute("INSERT INTO subcategorias (categoria_id, nome) VALUES (%s, %s)", (mus_id, "K-pop"))
+
+    from eventos import criar_schema_eventos
+    criar_schema_eventos(conn)
 
     conn.commit()
     cur.close()
@@ -777,20 +791,11 @@ def obter_apelido(user_id: int, username: str = "") -> tuple[str, bool]:
         return f"@{uname_fallback}", False
     return f"Mixer #{str(user_id)[-4:]}", False
 
-def processar_imagem_carta(image_bytes: bytes, tier: int) -> io.BytesIO:
-    """Padroniza qualquer foto em 900x1200 (3:4) e aplica a moldura PNG do tier se existir."""
+def _compor_imagem_com_moldura(image_bytes: bytes, moldura_bytes: bytes | None) -> io.BytesIO:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     base = ImageOps.fit(img, (LARGURA_CARTA, ALTURA_CARTA), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT png_bytes FROM molduras WHERE tier = %s", (tier,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if row and row[0]:
-        moldura = Image.open(io.BytesIO(bytes(row[0]))).convert("RGBA")
+    if moldura_bytes:
+        moldura = Image.open(io.BytesIO(bytes(moldura_bytes))).convert("RGBA")
         if moldura.size != (LARGURA_CARTA, ALTURA_CARTA):
             moldura = moldura.resize((LARGURA_CARTA, ALTURA_CARTA), Image.Resampling.LANCZOS)
         final_img = Image.alpha_composite(base, moldura)
@@ -801,6 +806,67 @@ def processar_imagem_carta(image_bytes: bytes, tier: int) -> io.BytesIO:
     final_img.convert("RGB").save(saida, format="JPEG", quality=92)
     saida.seek(0)
     return saida
+
+def processar_imagem_carta(image_bytes: bytes, tier: int) -> io.BytesIO:
+    """Padroniza a carta e aplica a moldura cadastrada para o tier, se houver."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT png_bytes FROM molduras WHERE tier = %s", (tier,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return _compor_imagem_com_moldura(image_bytes, row[0] if row else None)
+
+async def _regenerar_cartas_moldura_tier(context, tier: int, moldura_bytes: bytes | None, chat_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, original_file_id, media_type FROM cartas WHERE tier=%s AND event_id IS NULL AND media_type='photo'", (tier,))
+    cartas = cur.fetchall()
+    cur.close()
+    conn.close()
+    atualizadas = 0
+    for carta_id, original_id, media_type in cartas:
+        if not original_id:
+            continue
+        try:
+            tg_file = await context.bot.get_file(original_id)
+            original = io.BytesIO()
+            await tg_file.download_to_memory(original)
+            resultado = await asyncio.to_thread(_compor_imagem_com_moldura, original.getvalue(), moldura_bytes)
+            enviada = await context.bot.send_photo(chat_id=chat_id, photo=resultado)
+            novo_file_id = enviada.photo[-1].file_id
+            await enviada.delete()
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("UPDATE cartas SET file_id=%s WHERE id=%s", (novo_file_id, carta_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+            atualizadas += 1
+        except Exception as exc:
+            print(f"Falha ao atualizar moldura da carta #{carta_id}: {exc}", flush=True)
+    return atualizadas
+
+async def _regenerar_cartas_moldura_evento(context, event_id: int, moldura_bytes: bytes, chat_id: int):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id,original_file_id FROM cartas WHERE event_id=%s AND media_type='photo'", (event_id,))
+    cards = cur.fetchall(); cur.close(); conn.close()
+    atualizadas = 0
+    for card_id, original_id in cards:
+        if not original_id:
+            continue
+        try:
+            tg_file = await context.bot.get_file(original_id)
+            original = io.BytesIO(); await tg_file.download_to_memory(original)
+            resultado = await asyncio.to_thread(_compor_imagem_com_moldura, original.getvalue(), moldura_bytes)
+            enviada = await context.bot.send_photo(chat_id=chat_id, photo=resultado)
+            novo_file_id = enviada.photo[-1].file_id; await enviada.delete()
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("UPDATE cartas SET file_id=%s WHERE id=%s", (novo_file_id, card_id))
+            conn.commit(); cur.close(); conn.close(); atualizadas += 1
+        except Exception as exc:
+            print(f"Falha ao atualizar moldura do evento na carta #{card_id}: {exc}", flush=True)
+    return atualizadas
 
 async def enviar_midia_carta(message, file_id: str, media_type: str, legenda: str, bot=None):
     """Envia a foto/GIF da carta com fallback seguro para grupos com restrições."""
@@ -892,6 +958,8 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verificar_usuario(user.id, user.username)
     texto = obter_texto_publico("comandos_texto")
     comandos_novos = [
+        ("/eventos", "• /eventos — Abrir eventos ativos e suas cartas especiais"),
+        ("/natalpresente", "• /natalpresente @pessoa — Presentear cartas do evento de Natal"),
         ("/trocar", "• /trocar <code>@pessoa</code> ou apelido — Propor troca escolhendo cartas pelos botões"),
         ("/doar", "• /doar <code>@pessoa</code> ou apelido — Doar cartas com botões"),
         ("/wishlist", "• /wishlist [pessoa] — Editar sua wishlist ou consultar a de alguém"),
@@ -1430,7 +1498,7 @@ async def handler_custom_spin_texto(update: Update, context: ContextTypes.DEFAUL
         query=None,
     )
 
-async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None, subsub_id=None, qtd_giros: int = 1):
+async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=None, sub_id=None, subsub_id=None, qtd_giros: int = 1, event_id=None):
     await _processar_giros_core(
         user=query.from_user,
         chat_id=query.message.chat_id,
@@ -1442,6 +1510,7 @@ async def executar_sorteio(query, context: ContextTypes.DEFAULT_TYPE, cat_id=Non
         sub_id=sub_id,
         subsub_id=subsub_id,
         qtd_giros=qtd_giros,
+        event_id=event_id,
         query=query,
     )
 
@@ -1456,6 +1525,7 @@ async def _processar_giros_core(
     sub_id=None,
     subsub_id=None,
     qtd_giros: int = 1,
+    event_id=None,
     query=None,
 ):
     if user.id in GIROS_EM_ANDAMENTO:
@@ -1504,6 +1574,16 @@ async def _processar_giros_core(
                 (cat_id, sub_id, subsub_id)
             )
 
+        if event_id is not None:
+            if cat_id is None:
+                cur.execute(sql_base + " WHERE c.event_id = %s", (event_id,))
+            elif sub_id is None:
+                cur.execute(sql_base + " WHERE c.event_id = %s AND c.categoria_id = %s", (event_id, cat_id))
+            elif subsub_id is None:
+                cur.execute(sql_base + " WHERE c.event_id = %s AND c.categoria_id = %s AND c.subcategoria_id = %s", (event_id, cat_id, sub_id))
+            else:
+                cur.execute(sql_base + " WHERE c.event_id = %s AND c.categoria_id = %s AND c.subcategoria_id = %s AND c.subsubcategoria_id = %s", (event_id, cat_id, sub_id, subsub_id))
+
         cartas = cur.fetchall()
         if not cartas:
             if query:
@@ -1517,8 +1597,17 @@ async def _processar_giros_core(
         if query:
             await query.answer()
 
-        pesos = [c[9] for c in cartas]
-        sorteadas = random.choices(cartas, weights=pesos, k=qtd_efetiva)
+        cartas_ss_plus = [c for c in cartas if c[8] == 6]
+        cartas_normais = [c for c in cartas if c[8] != 6]
+        if cartas_normais:
+            sorteadas = []
+            for _ in range(qtd_efetiva):
+                if cartas_ss_plus and random.random() < CHANCE_SS_PLUS:
+                    sorteadas.append(random.choice(cartas_ss_plus))
+                else:
+                    sorteadas.append(random.choices(cartas_normais, weights=[c[9] for c in cartas_normais], k=1)[0])
+        else:
+            sorteadas = random.choices(cartas_ss_plus or cartas, weights=[c[9] for c in (cartas_ss_plus or cartas)], k=qtd_efetiva)
 
         cur.execute("UPDATE usuarios SET giros_restantes = giros_restantes - %s WHERE user_id = %s", (qtd_efetiva, user.id))
 
@@ -1598,6 +1687,8 @@ async def _processar_giros_core(
                 tiers_cadastrados=tiers_cadastrados,
                 giros_restantes=giros_restantes,
             )
+            if tier == 6:
+                legenda += "\n\n💠 <b>SS+ ultra raro!</b> Você pode vender esta carta na loja por <b>1.000 EccoCoins</b>."
 
             await enviar_midia_carta(reply_anchor, file_id, media_type, legenda, bot=bot)
             await enviar_texto_seguro(chat_id, rodape_txt, bot, thread_id=thread_id)
@@ -1639,6 +1730,8 @@ async def _processar_giros_core(
                     vezes_txt=vezes_txt,
                     tag_nova=tag_nova,
                 ))
+                if c_tier == 6:
+                    linhas.append("💠 <b>SS+ ultra raro!</b> Cada carta SS+ pode ser vendida por <b>1.000 EccoCoins</b> na loja.")
 
             legenda = "\n".join(linhas)
             legenda_resultado = legenda
@@ -2155,7 +2248,7 @@ async def cmd_artista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💿 <b>Progresso:</b> {obtidas}/{total} cartas\n"
     ]
 
-    for t in range(1, 6):
+    for t in range(1, 7):
         t_cfg = TIERS_CONFIG[t]
         t_em = obter_emoji_tier(t)
         if t in mapa_tiers:
@@ -2566,11 +2659,18 @@ async def _mostrar_resultados_inventario(query, context, user_id: int, prefixo: 
 async def _mostrar_opcoes_venda(query, context, carta_ids: list[int], nome: str, total: int, alltiers_id: int | None = None):
     context.user_data["loja_sale_cards"] = carta_ids
     context.user_data["loja_sale_name"] = nome
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT c.id, c.tier, c.event_id, COALESCE(SUM(i.quantidade),0) FROM cartas c LEFT JOIN inventario i ON i.carta_id=c.id AND i.user_id=%s WHERE c.id=ANY(%s) GROUP BY c.id,c.tier,c.event_id", (context.user_data.get("loja_owner"), carta_ids))
+    precos = {cid: (150 if eid is not None else 1000 if tier == 6 else 1, qtd) for cid,tier,eid,qtd in cur.fetchall()}
+    cur.close(); conn.close()
+    fila_valores = [valor for cid in carta_ids for valor in [precos.get(cid, (1,0))[0]] * precos.get(cid,(1,0))[1]]
     quantidades = sorted({n for n in (1, 2, 3, 5, 10, total) if n <= total})
     botoes = []
     linha = []
     for qtd in quantidades:
-        linha.append(InlineKeyboardButton(f"Vender {qtd} (+{qtd} EccoCoins)", callback_data=f"loja|venderq|{qtd}"))
+        recebido_previsto = sum(fila_valores[:qtd])
+        linha.append(InlineKeyboardButton(f"Vender {qtd} (+{recebido_previsto} EccoCoins)", callback_data=f"loja|venderq|{qtd}"))
         if len(linha) == 2:
             botoes.append(linha)
             linha = []
@@ -2587,7 +2687,7 @@ async def _mostrar_opcoes_venda(query, context, carta_ids: list[int], nome: str,
             botoes.append([InlineKeyboardButton("Vender todos os tiers", callback_data=f"loja|alltiers|{alltiers_id}")])
     botoes.append([InlineKeyboardButton("✏️ Digitar quantidade", callback_data="loja|custom")])
     botoes.append([InlineKeyboardButton("⬅️ Voltar", callback_data="loja|vender")])
-    texto = renderizar_template(obter_texto_publico("loja_venda_quantidade"), quantidade=total, carta=esc(nome))
+    texto = f"Você tem {total}x <b>{esc(nome)}</b>. Cada carta comum vale 1 EccoCoin, SS+ vale 1.000 e carta de evento vale 150. Escolha a quantidade:"
     markup = InlineKeyboardMarkup(botoes)
     if hasattr(query, "answer"):
         await query.answer()
@@ -2600,14 +2700,17 @@ def _vender_copias_por_eccocoins(user_id: int, carta_ids: list[int], quantidade:
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM usuarios WHERE user_id = %s FOR UPDATE", (user_id,))
     cur.fetchone()
-    cur.execute("SELECT carta_id, SUM(quantidade) FROM inventario WHERE user_id = %s AND carta_id = ANY(%s) GROUP BY carta_id", (user_id, carta_ids))
-    disponiveis = {cid: qtd for cid, qtd in cur.fetchall()}
+    cur.execute("SELECT i.carta_id, SUM(i.quantidade), c.tier, c.event_id FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id = %s AND i.carta_id = ANY(%s) GROUP BY i.carta_id,c.tier,c.event_id", (user_id, carta_ids))
+    rows = cur.fetchall()
+    disponiveis = {cid: qtd for cid, qtd, _, _ in rows}
+    valores = {cid: (150 if event_id is not None else 1000 if tier == 6 else 1) for cid, _, tier, event_id in rows}
     if quantidade < 1 or sum(disponiveis.values()) < quantidade:
         conn.rollback()
         cur.close()
         conn.close()
-        return False, 0
+        return False, 0, 0
     restante = quantidade
+    recebido = 0
     for carta_id in carta_ids:
         vender = min(restante, disponiveis.get(carta_id, 0))
         if vender:
@@ -2615,16 +2718,17 @@ def _vender_copias_por_eccocoins(user_id: int, carta_ids: list[int], quantidade:
                 conn.rollback()
                 cur.close()
                 conn.close()
-                return False, 0
+                return False, 0, 0
+            recebido += vender * valores.get(carta_id, 1)
             restante -= vender
         if restante == 0:
             break
-    cur.execute("UPDATE usuarios SET aqua_coins = aqua_coins + %s WHERE user_id = %s RETURNING aqua_coins", (quantidade, user_id))
+    cur.execute("UPDATE usuarios SET aqua_coins = aqua_coins + %s WHERE user_id = %s RETURNING aqua_coins", (recebido, user_id))
     saldo = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
-    return True, saldo
+    return True, saldo, recebido
 
 async def callback_loja(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2709,7 +2813,7 @@ async def callback_loja(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quantidade = int(partes[2])
         carta_ids = context.user_data.get("loja_sale_cards", [])
         nome = context.user_data.get("loja_sale_name", "carta")
-        sucesso, saldo = _vender_copias_por_eccocoins(user_id, carta_ids, quantidade)
+        sucesso, saldo, recebido = _vender_copias_por_eccocoins(user_id, carta_ids, quantidade)
         if not sucesso:
             await query.answer("Você não tem mais essa quantidade.", show_alert=True)
             return
@@ -2717,7 +2821,7 @@ async def callback_loja(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("loja_sale_name", None)
         await query.answer("Venda concluída!")
         await query.edit_message_text(
-            renderizar_template(obter_texto_publico("loja_vendido"), quantidade=quantidade, carta=esc(nome), saldo=saldo),
+            renderizar_template(obter_texto_publico("loja_vendido"), quantidade=quantidade, carta=esc(nome), saldo=saldo).replace(f"{quantidade} EccoCoins", f"{recebido} EccoCoins"),
             parse_mode="HTML",
         )
         return
@@ -2802,6 +2906,10 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
     user = update.effective_user
     if not msg or not user or not msg.text:
         return
+    if context.user_data.get("evento_pendente"):
+        manager = context.application.bot_data.get("eventos_manager")
+        if manager and await manager.processar_texto(update, context):
+            raise ApplicationHandlerStop
     busca = msg.text.strip()
     if context.user_data.get("cm_search_pending"):
         await catmgr_search_text(update, context)
@@ -2841,7 +2949,7 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
             raise ApplicationHandlerStop
         carta_ids = context.user_data.get("loja_sale_cards", [])
         nome = context.user_data.get("loja_sale_name", "carta")
-        sucesso, saldo = _vender_copias_por_eccocoins(user.id, carta_ids, quantidade)
+        sucesso, saldo, recebido = _vender_copias_por_eccocoins(user.id, carta_ids, quantidade)
         if not sucesso:
             await msg.reply_text("Você não tem essa quantidade disponível para venda.")
             context.user_data["loja_custom_pending"] = False
@@ -2850,7 +2958,7 @@ async def handler_pesquisas_e_venda(update: Update, context: ContextTypes.DEFAUL
         context.user_data.pop("loja_sale_cards", None)
         context.user_data.pop("loja_sale_name", None)
         await msg.reply_text(
-            renderizar_template(obter_texto_publico("loja_vendido"), quantidade=quantidade, carta=esc(nome), saldo=saldo),
+            renderizar_template(obter_texto_publico("loja_vendido"), quantidade=quantidade, carta=esc(nome), saldo=saldo).replace(f"{quantidade} EccoCoins", f"{recebido} EccoCoins"),
             parse_mode="HTML",
         )
         raise ApplicationHandlerStop
@@ -2917,21 +3025,21 @@ def _montar_botoes_inventario(user_id: int, prefixo: str, page: int = 0, itens_p
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*) FROM (
-            SELECT carta_id FROM inventario WHERE user_id = %s GROUP BY carta_id HAVING SUM(quantidade) > 0
+            SELECT i.carta_id FROM inventario i JOIN cartas c ON c.id=i.carta_id WHERE i.user_id = %s AND (%s <> 'doarui' OR c.event_id IS NULL) GROUP BY i.carta_id HAVING SUM(i.quantidade) > 0
         ) itens
-    """, (user_id,))
+    """, (user_id, prefixo))
     total = cur.fetchone()[0]
     total_paginas = max(1, (total + itens_por_pagina - 1) // itens_por_pagina)
     page = max(0, min(page, total_paginas - 1))
     cur.execute("""
         SELECT c.id, c.nome, c.tier, SUM(i.quantidade)
         FROM inventario i JOIN cartas c ON c.id = i.carta_id
-        WHERE i.user_id = %s
+        WHERE i.user_id = %s AND (%s <> 'doarui' OR c.event_id IS NULL)
         GROUP BY c.id, c.nome, c.tier
         HAVING SUM(i.quantidade) > 0
         ORDER BY c.nome, c.tier, c.id
         LIMIT %s OFFSET %s
-    """, (user_id, itens_por_pagina, page * itens_por_pagina))
+    """, (user_id, prefixo, itens_por_pagina, page * itens_por_pagina))
     itens = cur.fetchall()
     cur.close()
     conn.close()
@@ -3074,12 +3182,15 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not fluxo.get("offered_id"):
             conn = get_db()
             cur = conn.cursor()
-            cur.execute("SELECT c.nome, c.tier FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (carta_id, query.from_user.id))
+            cur.execute("SELECT c.nome, c.tier, c.event_id FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (carta_id, query.from_user.id))
             carta = cur.fetchone()
             cur.close()
             conn.close()
             if not carta:
                 await query.answer("Essa carta não está mais na sua coleção.", show_alert=True)
+                return
+            if carta[2] is not None and carta[1] < 4:
+                await query.answer("Carta de evento só pode ser trocada por tier 4, tier 5, SS+ ou outra carta de evento.", show_alert=True)
                 return
             fluxo["offered_id"] = carta_id
             _, markup, _, total = _montar_botoes_inventario(fluxo["target_id"], "tradeui")
@@ -3099,7 +3210,7 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pedido_id = carta_id
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT c.nome, c.tier FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (pedido_id, fluxo["target_id"]))
+            cur.execute("SELECT c.nome, c.tier, c.event_id FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s AND i.quantidade>0 LIMIT 1", (pedido_id, fluxo["target_id"]))
         pedida = cur.fetchone()
         cur.execute("SELECT nome, tier FROM cartas WHERE id = %s", (fluxo["offered_id"],))
         oferecida = cur.fetchone()
@@ -3108,6 +3219,13 @@ async def callback_troca_ui(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             await query.answer("Uma das cartas não está mais disponível.", show_alert=True)
             context.user_data.pop("tradeui", None)
+            return
+        cur.execute("SELECT event_id FROM cartas WHERE id=%s", (fluxo["offered_id"]))
+        evento_oferecida = cur.fetchone()[0]
+        evento_pedida = pedida[2]
+        if (evento_oferecida is not None and evento_pedida is None and pedida[1] < 4) or (evento_pedida is not None and evento_oferecida is None and oferecida[1] < 4):
+            cur.close(); conn.close()
+            await query.answer("Carta de evento só pode ser trocada por tier 4, tier 5, SS+ ou outra carta de evento.", show_alert=True)
             return
         cur.execute(
             "INSERT INTO trocas (remetente_id, destinatario_id, carta_oferecida_id, carta_pedida_id, origin_chat_id) VALUES (%s, %s, %s, %s, %s) RETURNING id",
@@ -3302,12 +3420,15 @@ async def callback_doarui(update: Update, context: ContextTypes.DEFAULT_TYPE):
         carta_id = int(partes[2])
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT c.nome, c.tier, SUM(i.quantidade) FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s GROUP BY c.id, c.nome, c.tier HAVING SUM(i.quantidade)>0", (carta_id, query.from_user.id))
+        cur.execute("SELECT c.nome, c.tier, SUM(i.quantidade), c.event_id FROM cartas c JOIN inventario i ON i.carta_id=c.id WHERE c.id=%s AND i.user_id=%s GROUP BY c.id, c.nome, c.tier HAVING SUM(i.quantidade)>0", (carta_id, query.from_user.id))
         carta = cur.fetchone()
         cur.close()
         conn.close()
         if not carta:
             await query.answer("Essa carta não está mais na sua coleção.", show_alert=True)
+            return
+        if carta[3] is not None:
+            await query.answer("Cartas de evento não podem ser doadas.", show_alert=True)
             return
         fluxo["carta_id"] = carta_id
         fluxo["carta_nome"] = carta[0]
@@ -3548,8 +3669,8 @@ async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_id = int(query.data.split("|")[1])
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT nome FROM categorias WHERE id = %s", (cat_id,))
-    cat_nome = cur.fetchone()[0]
+    cur.execute("SELECT nome, event_id FROM categorias WHERE id = %s", (cat_id,))
+    cat_nome, event_id = cur.fetchone()
     cur.execute("SELECT COUNT(*) FROM subcategorias WHERE categoria_id = %s", (cat_id,))
     tem_subs = cur.fetchone()[0] > 0
     cur.close()
@@ -3557,6 +3678,7 @@ async def wiz_escolher_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["cat_id"] = cat_id
     context.user_data["cat_nome"] = cat_nome
+    context.user_data["event_id"] = event_id
     context.user_data["sub_id"] = None
     context.user_data["sub_nome"] = None
     context.user_data["subsub_id"] = None
@@ -3922,6 +4044,13 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Envie uma <b>foto</b> ou <b>GIF</b> válido.", parse_mode="HTML")
         return ST_MIDIA
 
+    if context.user_data.get("event_id"):
+        await msg.reply_text(
+            "🎉 Carta de evento: ela não usa tiers normais. Confirme o cadastro:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Cadastrar carta do evento", callback_data="wiz_tier|1")], [InlineKeyboardButton("🔙 Voltar ao Studio", callback_data="wiz_cancel")]]),
+        )
+        return ST_TIER
+
     nome_carta = context.user_data["nome_carta"]
     conn = get_db()
     cur = conn.cursor()
@@ -3932,7 +4061,7 @@ async def wiz_receber_midia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     botoes = []
-    tiers_disponiveis = range(1, 6) if categoria_usa_tiers(cat_id) else range(1, 2)
+    tiers_disponiveis = range(1, 7) if categoria_usa_tiers(cat_id) else range(1, 2)
     for t in tiers_disponiveis:
         t_cfg = TIERS_CONFIG[t]
         em_btn = texto_limpo_botao(obter_emoji_tier(t))
@@ -3962,6 +4091,9 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tier = int(query.data.split("|")[1])
     nome_carta = context.user_data["nome_carta"]
     cat_id = context.user_data["cat_id"]
+    event_id = context.user_data.get("event_id")
+    if event_id:
+        tier = 1
     if not categoria_usa_tiers(cat_id) and tier != 1:
         await query.answer("Essa categoria usa tier único.", show_alert=True)
         return ST_TIER
@@ -3980,7 +4112,13 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(raw_file_id)
         buf_in = io.BytesIO()
         await tg_file.download_to_memory(buf_in)
-        buf_out = await asyncio.to_thread(processar_imagem_carta, buf_in.getvalue(), tier)
+        if event_id:
+            conn_frame = get_db(); cur_frame = conn_frame.cursor()
+            cur_frame.execute("SELECT moldura_png FROM eventos WHERE id=%s", (event_id,)); moldura_evento = cur_frame.fetchone()
+            cur_frame.close(); conn_frame.close()
+            buf_out = await asyncio.to_thread(_compor_imagem_com_moldura, buf_in.getvalue(), moldura_evento[0] if moldura_evento else None)
+        else:
+            buf_out = await asyncio.to_thread(processar_imagem_carta, buf_in.getvalue(), tier)
 
         sent_msg = await query.message.reply_photo(
             photo=buf_out,
@@ -3995,9 +4133,9 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO cartas (nome, categoria_id, subcategoria_id, subsubcategoria_id, tier, peso_drop, file_id, media_type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (nome_carta, cat_id, sub_id, subsub_id, tier, peso, final_file_id, media_type))
+        INSERT INTO cartas (nome, categoria_id, subcategoria_id, subsubcategoria_id, tier, peso_drop, file_id, media_type, original_file_id, event_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (nome_carta, cat_id, sub_id, subsub_id, tier, peso, final_file_id, media_type, raw_file_id, event_id))
     nova_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
@@ -4008,7 +4146,7 @@ async def wiz_escolher_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat_codigo, local_str = formatar_local_carta(cat_id, cat_nome, sub_id, sub_nome, subsub_id, subsub_nome)
     await query.message.reply_text(
         f"✅ <b>Carta cadastrada com sucesso!</b>\n\n"
-        f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n"
+        (f"🎉 <b>{nova_id}. {esc(nome_carta)}</b> • carta de evento\n" if event_id else f"{t_em} <b>{nova_id}. {esc(nome_carta)}.</b> <i>[{t_cfg['curto']}]</i>\n")
         f"💿 <b>{cat_codigo}. {local_str}</b>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Cadastrar outra carta", callback_data="studio_go|addcarta")],
@@ -4432,7 +4570,7 @@ async def ed_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         botoes = []
-        tiers_disponiveis = range(1, 6) if categoria_usa_tiers(d["cat_id"]) else range(1, 2)
+        tiers_disponiveis = range(1, 7) if categoria_usa_tiers(d["cat_id"]) else range(1, 2)
         for t in tiers_disponiveis:
             t_cfg = TIERS_CONFIG[t]
             em_btn = texto_limpo_botao(obter_emoji_tier(t))
@@ -5602,7 +5740,7 @@ def _montar_view_start_media() -> tuple[str, InlineKeyboardMarkup]:
 def _montar_view_tiers_emojis() -> tuple[str, InlineKeyboardMarkup]:
     linhas = ["🎨 <b>Emojis dos Tiers (Normal ou Premium)</b>\n"]
     botoes = []
-    for t in range(1, 6):
+    for t in range(1, 7):
         em = obter_emoji_tier(t)
         linhas.append(f"• <b>{TIERS_CONFIG[t]['nome']}:</b> {em}")
         botoes.append([InlineKeyboardButton(f"✏️ Alterar {TIERS_CONFIG[t]['curto']}", callback_data=f"txmgr|tier|{t}")])
@@ -5833,6 +5971,7 @@ async def cmd_studio_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📦 Mover artista/personagem", callback_data="studio_go|moverartista"),
         ],
     ]
+    botoes.append([InlineKeyboardButton("🎉 Eventos", callback_data="evento|admin")])
     await update.effective_message.reply_text(texto, reply_markup=InlineKeyboardMarkup(botoes), parse_mode="HTML")
 
 async def studio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5845,6 +5984,7 @@ async def studio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("📂 Categorias & grupos", callback_data="studio_go|categorias"), InlineKeyboardButton("📝 Textos públicos", callback_data="studio_go|textos")],
         [InlineKeyboardButton("📚 Catálogo", callback_data="studio_go|catalogo"), InlineKeyboardButton("📦 Mover artista", callback_data="studio_go|moverartista")],
     ])
+    teclado.inline_keyboard.append([InlineKeyboardButton("🎉 Eventos", callback_data="evento|admin")])
     await query.answer()
     await query.edit_message_text("🛠️ <b>Ecco-Mix Studio</b>\n\nEscolha o que deseja fazer:", reply_markup=teclado, parse_mode="HTML")
 
@@ -5889,6 +6029,17 @@ async def cmd_set_moldura(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+    total_atualizadas = await _regenerar_cartas_moldura_tier(context, tier, png_bytes, update.effective_chat.id)
+    await update.message.reply_text(f"Moldura salva e aplicada em {total_atualizadas} carta(s) existente(s) do {TIERS_CONFIG[tier]['nome']}.")
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT file_id FROM cartas WHERE tier=%s AND event_id IS NULL AND media_type='photo' ORDER BY id LIMIT 1", (tier,))
+    amostra = cur.fetchone()
+    cur.close()
+    conn.close()
+    if amostra:
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=amostra[0], caption=f"Prévia — {TIERS_CONFIG[tier]['nome']}")
+
 async def cmd_rem_moldura(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
         return
@@ -5910,6 +6061,9 @@ async def cmd_rem_moldura(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"🗑️ Moldura removida de <b>{TIERS_CONFIG[tier]['nome']}</b>.", parse_mode="HTML")
 
+    atualizadas = await _regenerar_cartas_moldura_tier(context, tier, None, update.effective_chat.id)
+    await update.message.reply_text(f"Moldura removida; {atualizadas} carta(s) restauradas da imagem original.")
+
 async def cmd_status_molduras(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bloqueio_nao_admin(update):
         return
@@ -5922,7 +6076,7 @@ async def cmd_status_molduras(update: Update, context: ContextTypes.DEFAULT_TYPE
     conn.close()
 
     linhas = ["🖼️ <b>Status das Molduras PNG</b>\n"]
-    for t in range(1, 6):
+    for t in range(1, 7):
         status = "✅ Moldura PNG ativa" if t in ativas else f"➖ Sem moldura (apenas {LARGURA_CARTA}×{ALTURA_CARTA})"
         linhas.append(f"• <b>{TIERS_CONFIG[t]['nome']}:</b> {status}")
 
@@ -6570,6 +6724,23 @@ async def main():
         .build()
     )
 
+    from eventos import GerenciadorEventos
+    eventos_manager = GerenciadorEventos({
+        "get_db": get_db, "esc": esc, "eh_admin": eh_admin,
+        "resolver_jogador": _resolver_jogador, "verificar_usuario": verificar_usuario,
+        "executar_sorteio": executar_sorteio,
+        "tier_nome": lambda tier: TIERS_CONFIG[tier]["nome"],
+        "retirar_inventario": _retirar_inventario, "adicionar_inventario": _adicionar_inventario,
+        "regenerar_moldura_evento": _regenerar_cartas_moldura_evento,
+    })
+    eventos_manager.registrar(app)
+
+    async def evento_midia_handler(update, context):
+        if context.user_data.get("evento_pendente"):
+            manager = context.application.bot_data.get("eventos_manager")
+            if manager:
+                await manager.processar_midia(update, context)
+
     # Assistente interativo /addcarta (com 3 níveis)
     conv_carta = ConversationHandler(
         entry_points=[
@@ -6709,7 +6880,7 @@ async def main():
     app.add_handler(CommandHandler(["catalogo", "cartas"], cmd_catalogo))
     app.add_handler(CommandHandler("artista", cmd_artista))
     app.add_handler(CommandHandler(["ranking", "top"], cmd_ranking))
-    app.add_handler(CommandHandler("colecao", cmd_colecao))
+    app.add_handler(CommandHandler(["colecao", "col"], cmd_colecao))
     app.add_handler(CommandHandler("carta", cmd_carta))
     app.add_handler(CommandHandler("trocar", cmd_trocar))
     app.add_handler(CommandHandler("doar", cmd_doar))
@@ -6749,6 +6920,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(callback_loja, pattern=r"^loja\|"))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_pesquisas_e_venda))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.Document.ALL, evento_midia_handler))
     # Listener de quantidade personalizada de giros (group=1 para não conflitar com wizards admin)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_custom_spin_texto), group=1)
 
@@ -6780,6 +6952,7 @@ async def main():
 
     await app.initialize()
     await app.start()
+    asyncio.create_task(eventos_manager.loop_agendado(app.bot))
     await asyncio.to_thread(repor_giros_diarios)
     asyncio.create_task(loop_reposicao_diaria())
 
@@ -6796,6 +6969,8 @@ async def main():
         BotCommand("doar", "Doar cartas por botões"),
         BotCommand("wishlist", "Editar ou consultar wishlist"),
         BotCommand("loja", "Vender cartas e comprar giros"),
+        BotCommand("eventos", "Ver eventos ativos"),
+        BotCommand("natalpresente", "Presentear uma carta de Natal"),
         BotCommand("meuid", "Ver seu ID numérico"),
     ])
 
