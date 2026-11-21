@@ -412,7 +412,7 @@ def extrair_html_com_custom_emojis(message) -> str:
     total_bytes = len(utf16_bytes)
     eventos = {}
 
-    for ent in entities:
+    for ordem, ent in enumerate(entities):
         inicio = max(0, min(total_bytes, ent.offset * 2))
         fim = max(inicio, min(total_bytes, (ent.offset + ent.length) * 2))
         tipo = ent.type
@@ -457,8 +457,8 @@ def extrair_html_com_custom_emojis(message) -> str:
 
         if abre is not None:
             tamanho = fim - inicio
-            eventos.setdefault(inicio, {"fecha": [], "abre": []})["abre"].append((tamanho, abre))
-            eventos.setdefault(fim, {"fecha": [], "abre": []})["fecha"].append((tamanho, fecha))
+            eventos.setdefault(inicio, {"fecha": [], "abre": []})["abre"].append((tamanho, ordem, abre))
+            eventos.setdefault(fim, {"fecha": [], "abre": []})["fecha"].append((tamanho, ordem, fecha))
 
     partes = []
     cursor = 0
@@ -466,9 +466,9 @@ def extrair_html_com_custom_emojis(message) -> str:
         if pos > cursor:
             partes.append(html.escape(utf16_bytes[cursor:pos].decode("utf-16-le", errors="replace"), quote=False))
         evento = eventos[pos]
-        # Feche primeiro o intervalo mais interno e abra primeiro o maior.
-        partes.extend(tag for _, tag in sorted(evento["fecha"], key=lambda item: item[0]))
-        partes.extend(tag for _, tag in sorted(evento["abre"], key=lambda item: item[0], reverse=True))
+        # Para intervalos empatados, feche em ordem inversa à abertura.
+        partes.extend(tag for _, _, tag in sorted(evento["fecha"], key=lambda item: (item[0], -item[1])))
+        partes.extend(tag for _, _, tag in sorted(evento["abre"], key=lambda item: (-item[0], item[1])))
         cursor = pos
     if cursor < total_bytes:
         partes.append(html.escape(utf16_bytes[cursor:].decode("utf-16-le", errors="replace"), quote=False))
